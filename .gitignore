@@ -1,0 +1,41 @@
+# ===== 编译输出（不提交）=====
+Debug/
+Release/
+build/
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.su
+*.i
+*.siz
+
+# ===== STM32CubeIDE / Eclipse 临时文件 =====
+*.launch
+.metadata/
+.project.bak
+.cproject.bak
+.mxproject.bak
+
+# ===== 操作系统 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== 编辑器 =====
+.vscode/
+.idea/
+*.swp
+*~
+
+# ===== Python（第 3 周训练脚本用）=====
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ===== 采集的数据集（体积大，按需决定是否提交）=====
+# data/
