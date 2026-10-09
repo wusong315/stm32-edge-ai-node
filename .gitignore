@@ -41,5 +41,5 @@ venv/
 # 工具的默认输出落点，用法见 tools/README.md。
 # 确实想提交数据集样本时：git add -f <file>
 data/
-windows/
-vibration*.png
+windows*/
+vibration*
