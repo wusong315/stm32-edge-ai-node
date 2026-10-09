@@ -37,5 +37,9 @@ __pycache__/
 .venv/
 venv/
 
-# ===== 采集的数据集（体积大，按需决定是否提交）=====
-# data/
+# ===== 采集的数据集 / PC 端工具输出（体积大，默认不提交）=====
+# 工具的默认输出落点，用法见 tools/README.md。
+# 确实想提交数据集样本时：git add -f <file>
+data/
+windows/
+vibration*.png
