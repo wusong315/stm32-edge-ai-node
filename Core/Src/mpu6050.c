@@ -111,10 +111,16 @@ mpu6050_status_t MPU6050_Init(I2C_HandleTypeDef *hi2c)
     return MPU6050_ERR_I2C;
   }
 
-  /* ---- 4. 数字低通滤波 DLPF_CFG = 1（加速度带宽约 184Hz，陀螺约 188Hz）
-            配 1kHz 采样：Nyquist 500Hz > 184Hz，不会混叠；
-            同时滤波能削掉电机电流噪声。 ---- */
-  if (mpu_reg_write(MPU6050_REG_CONFIG, 0x01U) != HAL_OK)
+  /* ---- 4. 数字低通滤波 DLPF_CFG = 0（加速度带宽 **260Hz**，延迟 0ms）
+            🔴 这里必须是 0，不能用 1 —— 理由（见 RISKS.md R17）：
+              MPU6050 加速度计带宽**最高只有 260Hz**，而本项目叶频是 300–540Hz，
+              本来就已经在带宽之外。DLPF_CFG=1 只给到 184Hz，会把叶频整段再压低
+              （300Hz 约 −8dB、540Hz 约 −19dB），而不平衡故障的主特征恰恰就是
+              叶频幅值 → 信噪比和灵敏度都会掉。
+              所以取**能用满的最大带宽 260Hz**，把能留的叶频能量留住。
+            代价：抗混叠差一点（1kHz 采样、Nyquist 500Hz，260Hz 之后衰减较缓）。
+              → 上板后**必须先用频谱验证叶频是否真的可见**，不可见的对策见 R17。 ---- */
+  if (mpu_reg_write(MPU6050_REG_CONFIG, MPU6050_DLPF_CFG) != HAL_OK)
   {
     return MPU6050_ERR_I2C;
   }
