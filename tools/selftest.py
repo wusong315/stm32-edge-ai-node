@@ -21,6 +21,7 @@ import numpy as np
 
 import vibframe as vf
 import vibsource as vs
+import check_rate as cr
 
 _fail = 0
 _pass = 0
@@ -354,6 +355,70 @@ def t_cli_smoke():
         check_eq("无数据时退出码 2", rc3, 2)
 
 
+def t_rate_check():
+    """采样节拍实测：既要算得准，也要能识破真机上踩过的那个坑。"""
+    print("\n[13] 采样节拍实测（check_rate.py 的纯逻辑）")
+
+    # --- 黄金样本：固件 mode 0 的真实行格式（权威 = main.c 里的 printf）---
+    real = (b"t=     100 | ax= 11208 ay=  2640 az= 12360 | T= -5216"
+            b" | gx=    13 gy=   208 gz=  -272 | lost=21 ovf=0")
+    check_eq("解析固件真实数据行", cr.parse_line(real), (100, 21, 0))
+    check_eq("开机横幅不是数据行",
+             cr.parse_line(b"=== stm32-edge-ai-node boot ==="), None)
+    check_eq("WAIT 提示不是数据行",
+             cr.parse_line(b"[WAIT] MPU6050 not found (id=0x00). "
+                           b"Check wiring: VCC=3V3 GND SDA=PB7 SCL=PB6 AD0=GND"), None)
+    check_eq("空行不是数据行", cr.parse_line(b""), None)
+
+    # --- 拟合：完美 1000 Hz 必须被精确还原 ---
+    # 10 Hz 打印 × 每行 100 拍 ⇒ 1000 Hz
+    perfect = [(i / 10.0, i * 100) for i in range(120)]
+    k = cr.fit_slope(perfect)
+    check("完美数据拟合 == 1000 Hz", abs(k - 1000.0) < 1e-6, "k=%.6f" % k)
+
+    # --- 拟合 vs "末值−首值"：末点漂移时前者更稳 ---
+    # 理由不是"抗离群点"（最小二乘并不免疫），而是它用上了全部 N 个样本，
+    # 单点误差被摊薄；而末值−首值法只有那两个点，其中一个坏掉就全废。
+    drifted = list(perfect)
+    drifted[-1] = (drifted[-1][0], drifted[-1][1] - 300)     # 末点少 300 拍
+    k_d = cr.fit_slope(drifted)
+    naive_d = (drifted[-1][1] - drifted[0][1]) / (drifted[-1][0] - drifted[0][0])
+    check("末点漂移时，拟合的误差 < 末值−首值法",
+          abs(k_d - 1000.0) < abs(naive_d - 1000.0),
+          "fit=%.2f naive=%.2f" % (k_d, naive_d))
+
+    # --- 单调性检查器 ---
+    check_eq("单调数列的倒退次数 == 0", cr.backwards_count([1, 2, 3, 4]), 0)
+    check_eq("重复值也算一次倒退", cr.backwards_count([1, 2, 2, 3]), 1)
+
+    # --- 🔴 复现真机症状：USB 转串口 FIFO 吐出的"旧 run 尾部"混进新数据 ---
+    # 真机上就是这样：一行复位前的 t=35100 混进了新的 1000 Hz 序列，
+    # 结果量出 -1.6 Hz（第一次）和 727 Hz（第二次），让人以为固件有问题。
+    stale = [(0.000, 35100)] + [(i / 10.0, i * 100) for i in range(1, 100)]
+    naive_bad = (stale[-1][1] - stale[0][1]) / (stale[-1][0] - stale[0][0])
+    k_bad = cr.fit_slope(stale)
+    check("（对照）末值−首值法在这份数据上给出负节拍（复现真机）",
+          naive_bad < 0.0, "naive=%.1f" % naive_bad)
+    check("拟合虽好得多，但单靠拟合仍偏 >15% —— 所以必须靠守卫拦住",
+          abs(k_bad - 1000.0) > 150.0, "k=%.1f" % k_bad)
+    check("倒退次数 > 0 能把混流逮住",
+          cr.backwards_count([t for _, t in stale]) > 0,
+          "backwards=%d" % cr.backwards_count([t for _, t in stale]))
+    # 丢弃那行旧数据（等价于工具里的 --skip）后必须精确恢复
+    k_fixed = cr.fit_slope([s for s in stale if s[1] < 10000])
+    check("丢弃旧数据后精确恢复 1000 Hz", abs(k_fixed - 1000.0) < 1e-6,
+          "k=%.6f" % k_fixed)
+
+    # --- 参数守卫：样本不足 / 墙钟无变化 必须抛错，而不是返回一个假数 ---
+    for name, bad in (("样本 < 2 要抛 ValueError", [(0.0, 0)]),
+                      ("墙钟全相同要抛 ValueError", [(1.0, 5), (1.0, 9)])):
+        try:
+            cr.fit_slope(bad)
+            check(name, False, "居然没抛错")
+        except ValueError:
+            check(name, True)
+
+
 def main() -> int:
     print("=" * 68)
     print("stm32-edge-ai-node · PC 端数据链路自测（不需要硬件）")
@@ -370,6 +435,7 @@ def main() -> int:
     t_text_parsers()
     t_fake_physical_sanity()
     t_cli_smoke()
+    t_rate_check()
 
     print("\n" + "=" * 68)
     print("结果：%d 通过 / %d 失败" % (_pass, _fail))

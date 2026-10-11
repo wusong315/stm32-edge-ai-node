@@ -27,7 +27,8 @@ D:\STM32Projects\pc-venv\Scripts\python.exe
 | `vibframe.py` | **协议层**：帧格式常量、编码、流式+自恢复解析器、窗口切片 |
 | `vibsource.py` | **来源层**：串口 / 录制文件 / 假数据 / 文本模式解析 |
 | `parse_frames.py` | **CLI 主程序**：一条命令走完 采集→解析→存盘→切窗→出图 |
-| `selftest.py` | **自测**：74 条断言，不需要硬件 |
+| `check_rate.py` | **节拍实测**：用 PC 墙钟量固件的实际采样率（R6.4 第 ④ 步） |
+| `selftest.py` | **自测**：88 条断言，不需要硬件 |
 
 ## 先跑自测（每次改完代码都该跑）
 
@@ -36,7 +37,7 @@ cd D:\STM32Projects\stm32-edge-ai-node\tools
 D:\STM32Projects\pc-venv\Scripts\python.exe selftest.py
 ```
 
-全绿输出 `结果：74 通过 / 0 失败` 且退出码为 0。退出码非 0 说明协议层被动过。
+全绿输出 `结果：88 通过 / 0 失败` 且退出码为 0。退出码非 0 说明协议层被动过。
 
 ## 用法
 
@@ -78,6 +79,36 @@ python parse_frames.py --fake --csv demo.csv --plot demo.png
 python parse_frames.py --port COM5 --text --duration 5          # mode 1（200 Hz，g 值）
 python parse_frames.py --port COM5 --text --text-raw --duration 5  # mode 0（10 Hz，原始整数）
 ```
+
+### 5) 实测采样节拍（R6.4 第 ④ 步：**必须实测，不许只用理论值**）
+
+```
+python check_rate.py --port COM4
+python check_rate.py --port COM4 --expected 1000 --tol 1 --duration 20
+```
+
+做法：逐行读串口、给每行打 PC 侧墙钟时间戳，最小二乘拟合 `t(固件拍数) = k · 墙钟秒`，
+`k` 就是实测节拍。实测结果：
+
+```
+>>> 实测节拍 = 1000.01 Hz   偏差 +0.00 %
+>>> 结论：✅ 符合 1000.0 Hz（容差 ±2.0%）
+```
+
+**用途**：这是 `TIM2` 的 `PSC/ARR` 与 APB1 定时器时钟算错的**唯一**发现手段 ——
+`t` 只证明"中断在跑"，**不证明它跑在 1 kHz**（因为打印是每 100 拍一次，
+节拍错 10 倍、`t` 照样每次 +100）。
+
+> ⚠️ **固件必须处于 `APP_OUTPUT_MODE=0`** —— 那是唯一会打印 `t=` 的档。
+> ⚠️ **复位后头 3 秒的数据会被丢弃**（`--skip`，默认 3）。这不是矫情：
+> USB 转串口芯片的**器件侧 FIFO** 里压着复位前的最后几行，会在复位后与
+> 新数据挤进同一个 `read()` chunk、被打上同一个时间戳。
+> 实测教训：同一块板子，不丢头几秒量出 `-1.6 Hz` 和 `727 Hz`，丢 3 秒后立刻是 `1000.01 Hz`。
+> `ser.reset_input_buffer()` **清不掉器件 FIFO**。
+>
+> 输出里的 `t 倒退次数` 就是混流哨兵：**>0 先怀疑"新旧数据混流"，别怀疑固件**。
+
+**退出码**：`0` 在容差内 / `1` 超差 / `2` 没采到足够数据（脚本可直接据此 gate）。
 
 ## 命令行参数
 
