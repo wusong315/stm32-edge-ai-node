@@ -15,13 +15,17 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 import sys
+import tempfile
 
 import numpy as np
 
 import vibframe as vf
 import vibsource as vs
 import check_rate as cr
+import check_blade_peak as cb
 
 _fail = 0
 _pass = 0
@@ -419,6 +423,158 @@ def t_rate_check():
             check(name, True)
 
 
+def t_blade_peak():
+    """R17 频谱门禁：既要抓得到已知频率，也要能识破噪声与混叠。
+
+    🔴 这一节里最重要的不是"能不能抓到正弦"，而是**判据本身可不可信**：
+    门限若落在纯噪声可达的范围内，工具就是在掷硬币。所以下面有两条断言专门
+    去量"纯噪声的 SNR 上界"，还有两条去量"模型有没有低估这个上界"。
+    """
+    print("\n[14] 频谱门禁（check_blade_peak.py 的纯逻辑）")
+
+    rate = 1000.0
+    df = rate / cb.DEFAULT_NPERSEG          # ≈0.977 Hz
+    rng = np.random.default_rng(20261011)
+
+    def bin_sine(f_hz, amp, n, axes=(1,)):
+        """造一段 bin 对齐的正弦（幅度定标检查必须用对齐频率，否则峰会被窗稀释）。"""
+        t = np.arange(n) / rate
+        s = np.zeros((n, 3))
+        for k in axes:
+            s[:, k] = amp * np.sin(2.0 * np.pi * f_hz * t)
+        return s
+
+    # --- A) 幅度定标：给 0.05 g 的正弦，谱峰就得是 0.05 g ±10% ---
+    n = 10240                                  # 1024 的整数倍，避免半段
+    f_bin = 369 * df                           # = 360.35 Hz，正好落在频点上
+    r = cb.analyse(bin_sine(f_bin, 0.05, n), rate)
+    row = r["axes"][1]
+    check("幅度定标：0.05 g 正弦 → 谱峰 ≈ 0.05 g",
+          abs(row["blade_amp"] - 0.05) < 0.005, "got=%.5f" % row["blade_amp"])
+
+    # --- B) 频率定位：误差必须小于一个频率分辨单元 ---
+    check("频率定位：%.2f Hz 被还原且误差 < Δf" % f_bin,
+          abs(row["blade_hz"] - f_bin) < df,
+          "got=%.2f want=%.2f" % (row["blade_hz"], f_bin))
+    r180 = cb.analyse(bin_sine(180.0, 0.05, n), rate)
+    check("转频带也能定位（180 Hz）",
+          abs(r180["axes"][1]["rot_hz"] - 180.0) <= df,
+          "got=%.2f" % r180["axes"][1]["rot_hz"])
+
+    # --- C) 选轴：只有 ay 有振动时，best_axis 必须是 ay 且只有它过 ---
+    s = rng.normal(0.0, 0.005, (n, 3))
+    s[:, 1] += 0.05 * np.sin(2.0 * np.pi * f_bin * np.arange(n) / rate)
+    r = cb.analyse(s, rate)
+    check_eq("best_axis 选中有振动的那一轴", r["best_axis"], "ay")
+    check("只有 ay 过判据（ax/az 是噪声）",
+          r["axes"][1]["blade_ok"] and not r["axes"][0]["blade_ok"]
+          and not r["axes"][2]["blade_ok"])
+
+    # --- D) 🔴 纯噪声的 SNR 上界：判据可信度的地基 ---
+    # 1 段（1 秒）和 18 段（10 秒）各试 12 次，取最大值。
+    def noise_max(n_pts, segs_hint, trials=12):
+        vals = []
+        for _ in range(trials):
+            s = np.zeros((n_pts, 3))
+            s[:, 2] = rng.normal(0.0, 0.01, n_pts)
+            vals.append(cb.analyse(s, rate)["axes"][2]["blade_snr"])
+        return max(vals), cb.segment_count(n_pts, cb.DEFAULT_NPERSEG,
+                                           cb.DEFAULT_OVERLAP)
+
+    m18, k18 = noise_max(10000, 18)
+    m1, k1 = noise_max(1000, 1)
+    check_eq("10 秒数据的段数 == 18", k18, 18)
+    check_eq("1 秒数据的段数 == 1", k1, 1)
+    check("纯噪声（18 段）刷不出 8 dB —— 12 dB 门限有 ≥4 dB 余量", m18 < 8.0,
+          "max=%.2f dB" % m18)
+    check("纯噪声（1 段）却能刷过 8 dB —— 所以段数少时判据不可信", m1 > 8.0,
+          "max=%.2f dB" % m1)
+
+    # --- E) 模型必须"不低估"实测上界，否则那两个警告数字就是假的 ---
+    check("null_bound(18 段) >= 实测 max（模型保守）",
+          cb.null_bound_db(18) >= m18,
+          "model=%.2f 实测=%.2f" % (cb.null_bound_db(18), m18))
+    check("null_bound(1 段) >= 实测 max（模型保守）",
+          cb.null_bound_db(1) >= m1,
+          "model=%.2f 实测=%.2f" % (cb.null_bound_db(1), m1))
+    check("段数越多上界越低（单调不增）",
+          all(cb.null_bound_db(i) >= cb.null_bound_db(i + 4) for i in range(2, 20)))
+
+    # --- F) 建议时长：按它采，上界必须真的落到门限下方 6 dB ---
+    need_s = cb.suggest_seconds(12.0)
+    need_n = int(need_s * rate)
+    need_k = cb.segment_count(need_n, cb.DEFAULT_NPERSEG, cb.DEFAULT_OVERLAP)
+    check("suggest_seconds(12) 是整秒", float(need_s).is_integer(), "%.3f" % need_s)
+    check("按建议时长采，噪声上界 <= 门限 − 6 dB",
+          cb.null_bound_db(need_k) <= 12.0 - 6.0 + 0.05,
+          "segs=%d bound=%.2f" % (need_k, cb.null_bound_db(need_k)))
+    check("建议时长落在 R6.4 用的 10 秒之内", need_s <= 10.0, "%.0f s" % need_s)
+
+    # --- G) 混叠：真实 612 Hz（> Nyquist 500）会被报成 388 Hz 的镜像 ---
+    rr = cb.analyse(bin_sine(612.0, 0.05, n), rate)
+    alias_row = rr["axes"][1]
+    check("612 Hz（> Nyquist）被折成 ≈388 Hz",
+          abs(alias_row["blade_hz"] - 388.0) < 3.0,
+          "got=%.1f" % alias_row["blade_hz"])
+    check("该峰被标记为'在可能混叠的区间内'（结论里会点出歧义）",
+          alias_row["blade_alias"])
+    check_eq("fold_range：带顶 660 > 500 时应给出 340–500",
+             cb.fold_range((300.0, 660.0), 1000.0), (340.0, 500.0))
+    check_eq("fold_range：带顶 450 < 500 时无歧义，返回 None",
+             cb.fold_range((300.0, 450.0), 1000.0), None)
+
+    # --- H) 判据看的是"相对本底"，不是绝对幅值 ---
+    s = np.zeros((n, 3))
+    s[:, 1] = rng.normal(0.0, 0.5, n)          # 幅值比上一组大 100 倍，但仍是噪声
+    check("0.5 g 的纯噪声也过不了（判据是 SNR，不是幅值）",
+          not cb.analyse(s, rate)["axes"][1]["blade_ok"])
+
+    # --- I) 去趋势：线性漂移不该被当成振动能量 ---
+    t = np.arange(n) / rate
+    drift = 0.5 * t / t[-1]                    # 0 → 0.5 g 的线性漂移
+    d_before = float(np.std(drift))
+    d_after = float(np.std(cb.detrend(drift)))
+    check("detrend 把线性漂移压掉 >100 倍", d_after < d_before / 100.0,
+          "before=%.4f after=%.6f" % (d_before, d_after))
+
+    # --- J) 参数守卫 + CSV 读写 ---
+    for name, fn in (("点数 < 64 要抛 ValueError",
+                      lambda: cb.analyse(np.zeros((40, 3)), rate)),
+                     ("形状不是 (N,3) 要抛 ValueError",
+                      lambda: cb.analyse(np.zeros((100, 2)), rate)),
+                     ("样本 < 8 点算频谱要抛 ValueError",
+                      lambda: cb.amplitude_spectrum(np.zeros(4), rate))):
+        try:
+            fn()
+            check(name, False, "居然没抛错")
+        except ValueError:
+            check(name, True)
+
+    tmp = tempfile.mkdtemp(prefix="cbp_")
+    try:
+        good = os.path.join(tmp, "good.csv")
+        tt = np.arange(3000) / rate
+        np.savetxt(good, np.column_stack([tt, np.sin(tt), np.cos(tt), tt * 0]),
+                   delimiter=",", header="t_s,ax_g,ay_g,az_g", comments="",
+                   fmt="%.6f")
+        got_rate, got_s, src = cb.load_csv(good)
+        check("从 t_s 列反推采样率 == 1000 Hz", abs(got_rate - 1000.0) < 1.0,
+              "got=%.3f (%s)" % (got_rate, src))
+        check_eq("样本形状 == (3000,3)",
+                 (len(got_s), got_s.shape[1]), (3000, 3))
+
+        bad = os.path.join(tmp, "bad.csv")
+        with open(bad, "w", encoding="utf-8") as fh:
+            fh.write("t_s,ax_g\n0.0,1.0\n0.001,1.1\n")
+        try:
+            cb.load_csv(bad)
+            check("缺列必须抛 ValueError（而不是静默算错）", False, "居然没抛错")
+        except ValueError:
+            check("缺列必须抛 ValueError（而不是静默报错）", True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> int:
     print("=" * 68)
     print("stm32-edge-ai-node · PC 端数据链路自测（不需要硬件）")
@@ -436,6 +592,7 @@ def main() -> int:
     t_fake_physical_sanity()
     t_cli_smoke()
     t_rate_check()
+    t_blade_peak()
 
     print("\n" + "=" * 68)
     print("结果：%d 通过 / %d 失败" % (_pass, _fail))
