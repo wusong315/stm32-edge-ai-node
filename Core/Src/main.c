@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "mpu6050.h"
+#include "neai_app.h"
 #include <stdio.h>
 /* USER CODE END Includes */
 
@@ -36,18 +37,22 @@
 /* =====================================================================
  * 应用配置（口径与依据见 MVP/docs/context/DECISIONS.md D15）
  * =====================================================================
- * 三档输出模式是**编译期开关**而不是运行期切换，理由：
- *   ① 模式 2 的 1 kHz 二进制流与模式 0/1 的人可读文字**不能共存** ——
+ * 四档输出模式是**编译期开关**而不是运行期切换，理由：
+ *   ① 模式 2 的 1 kHz 二进制流与模式 0/1/3 的人可读文字**不能共存** ——
  *      串口里混着二进制帧和文字，PC 端根本没法解析；
  *   ② 编译期剔除没用的分支，既省 Flash/RAM，也避免“未使用变量”告警。
  * 用 #ifndef 包住是为了能用 -DAPP_OUTPUT_MODE=n 在命令行覆盖，
- * 从而在无硬件时把三档都编译一遍做语法/告警检查。 */
+ * 从而在无硬件时把四档都编译一遍做语法/告警检查。 */
 
-/* 输出模式（三档，先跑通再往上加）：
+/* 输出模式（四档，先跑通再往上加）：
  *   0 = 调试文本 10 Hz —— 只打印原始整数，用来**验证接线和数据对不对**。
  *       第一次上板就用这一档：静置时 az 应该接近 +16384（1g）。
  *   1 = 文本模式 200 Hz —— 每 TEXT_DECIM 个采样点输出一行，给人看 / 画波形。
- *   2 = 二进制帧模式 1 kHz —— 原速采集，攒够一帧整包发出，用来**采数据集**。 */
+ *   2 = 二进制帧模式 1 kHz —— 原速采集，攒够一帧整包发出，用来**采数据集**。
+ *   3 = 在线推理模式 1 kHz —— 原速采集**直接喂给 NanoEdge AI 模型**（不往串口灌
+ *       原始数据），串口只输出相似度与推理耗时。**这是最终产品的形态。**
+ *       ⚠️ 依赖 `Core/Src/libneai.a` + `Core/Inc/NanoEdgeAI.h` 这一对库文件，
+ *          集成与换库步骤见 `MVP/docs/context/RUNBOOK.md` R10。 */
 #ifndef APP_OUTPUT_MODE
 #define APP_OUTPUT_MODE     (0)
 #endif
@@ -396,6 +401,54 @@ static void App_OnTick(void)
       g_frame_idx = 0U;
     }
   }
+
+#elif (APP_OUTPUT_MODE == 3)
+  /* -------------------------------------------------------------------
+   * 模式 3：在线推理 1 kHz —— 把连续采样喂给 NanoEdge AI 模型
+   * -------------------------------------------------------------------
+   * 与模式 2 一样按 1 kHz 原速读传感器，但数据**不往串口发**，
+   * 而是交给 neai_app 攒成一个窗口（DATA_INPUT_USER 点）后调用 learn()/detect()。
+   *
+   * 🔴 只有模式 3 会喂模型 —— 模式 0 是 10 Hz、模式 1 是 200 Hz，
+   *    采样节奏都不对，喂进去只会污染模型，所以坚决不喂。
+   *
+   * 🔴 模型未就绪（init 失败 / 传感器掉线）时**自动跳过**，不阻塞采样节拍；
+   *    原因会由 neai_app 打印，不会静默失败。
+   *
+   * 输出：事件行由 neai_app.c 按 APP_NEAI_PRINT_DECIM 节流打印；
+   *      这里每秒再补一行汇总，当"程序还活着"的心跳用。 */
+  {
+    mpu6050_accel_raw_t raw;
+    float               acc3[3];                       /* 传感器实际给的 3 轴 */
+    float               xyz[NEAI_APP_NUM_AXES];        /* 模型要求轴数（换库自动跟随） */
+    uint16_t            k;
+
+    if (MPU6050_ReadAccel(&raw) != MPU6050_OK)
+    {
+      g_sensor_ok = 0U;
+      return;
+    }
+    MPU6050_AccelToG(&raw, &acc3[0], &acc3[1], &acc3[2]);
+
+    /* 把传感器的 3 轴映射到模型要求的轴数上。
+     * 🔴 不能直接把 &acc3[1] / &acc3[2] 传给模型：占位库 AXIS_NUMBER=1，
+     *    那样写会**越界读栈**。这里显式按 NEAI_APP_NUM_AXES 逐元素拷贝，
+     *    少于 3 轴就当单轴模型用，多于 3 轴时余下补 0（本项目不会出现）。 */
+    for (k = 0U; k < (uint16_t)NEAI_APP_NUM_AXES; k++)
+    {
+      xyz[k] = (k < 3U) ? acc3[k] : 0.0f;
+    }
+
+    /* 返回值这里不用：日志由 neai_app 自己按节流打印。
+     * 将来做"异常告警点灯"时，在这里判 NEAI_PUSH_DETECTED + 相似度阈值即可。 */
+    (void)NEAI_AppPushSample(xyz);
+  }
+
+  /* 每秒一行汇总（心跳 + 健康度） */
+  if ((g_tick % 1000U) == 0U)
+  {
+    NEAI_AppPrintStats();
+  }
 #endif
 
 }
@@ -493,7 +546,17 @@ int main(void)
 #elif (APP_OUTPUT_MODE == 2)
   printf("mode 2: binary frames @1 kHz, %u bytes/frame\r\n",
          (unsigned)FRAME_TOTAL);
+#elif (APP_OUTPUT_MODE == 3)
+  printf("mode 3: on-device inference @1 kHz (NanoEdge AI, similarity + us)\r\n");
 #endif
+
+  /* ---- 初始化 NanoEdge AI -------------------------------------------
+   * 🔴 无论当前是哪个输出模式都初始化一次，有两个好处：
+   *    ① 一上电就在串口打出 NEAI_ID —— 这是"当前链的是哪个库"的铁证
+   *       （占位库的 ID 是 62e147...，换成自己的模型后必须变）；
+   *    ② 模式 0/1/2 下没人喂数据，所以它**完全是惰性的**，不影响采样与点灯验证。
+   * 若只想验证"没有 AI 的纯采集链路"，可用 -DAPP_NEAI_ENABLE=0 重编一版做对照。 */
+  NEAI_AppInit();
 
   /* ---- 启动 1 kHz 采样节拍 ------------------------------------------
    * 🔴 必须是 Start_IT（带中断）而不是 Start：
