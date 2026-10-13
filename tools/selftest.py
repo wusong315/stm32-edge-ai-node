@@ -28,6 +28,7 @@ import check_rate as cr
 import check_blade_peak as cb
 import pwm_sweep as ps
 import check_pwm_cmd as cpc
+import calib_dev as cd
 
 _fail = 0
 _pass = 0
@@ -1048,6 +1049,195 @@ def t_pwm_cmd():
     check_eq("--set 下界外也被拒", cpc.main(["--port", "COMx", "--led-test", "--set", "-3"]), 2)
 
 
+# ---------------------------------------------------------------------------
+def t_calib():
+    """第 ⑧ 件工具 calib_dev.py 的**纯函数层**（不碰串口、不碰硬件）。
+
+    只测能"真的失败"的东西：姿态表的轴/符号映射、六姿态解算能否**精确还原**
+    注入的 k/b、越界/缺姿态时是否拒绝、判据函数对**构造出来的坏姿态**是否报错。
+    采集层（要串口）与真机验证不在自测范围内 —— 那属于 T3 的现场判据。
+    """
+    print("\n[17] 六姿态静态标定（calib_dev.py 的纯逻辑：轴映射 / 判据 / 解算）")
+
+    # ---- 姿态表：轴序号 + 期望符号 ----
+    check_eq('axis_sign("+z")', cd.axis_sign("+z"), (2, 1))
+    check_eq('axis_sign("-y")', cd.axis_sign("-y"), (1, -1))
+    check_eq('axis_sign("+x")', cd.axis_sign("+x"), (0, 1))
+    check_eq("axis_of_pose('-z')", cd.axis_of_pose("-z"), 2)
+    check("POSE_HINT 覆盖全部 6 个姿态", set(cd.POSE_HINT) == set(cd.POSE_NAMES),
+          sorted(cd.POSE_HINT))
+    try:
+        cd.axis_sign("+w")
+        check("未知姿态抛 ValueError", False, "没抛异常")
+    except ValueError:
+        check("未知姿态抛 ValueError", True)
+
+    # ---- mean_sigma ----
+    const = np.tile([1.0, 2.0, 3.0], (50, 1))
+    m, sg = cd.mean_sigma(const)
+    check("mean_sigma：常量序列 σ 全 0、均值正确",
+          bool(np.allclose(sg, 0.0)) and bool(np.allclose(m, [1.0, 2.0, 3.0])),
+          "m=%s sg=%s" % (m, sg))
+    m0, s0 = cd.mean_sigma(np.zeros((0, 3)))
+    check("mean_sigma：空输入返回全 0（由调用方判 n < min_samples）",
+          bool(np.allclose(m0, 0.0)) and bool(np.allclose(s0, 0.0)))
+    _, sig = cd.mean_sigma(np.array([[1.0, 0, 0], [0.9, 0, 0], [1.1, 0, 0]]))
+    check("mean_sigma：σ 真能算出非零（±0.1 抖动 → 0.0816）",
+          abs(float(sig[0]) - 0.08165) < 0.002, "σx=%.5f" % sig[0])
+
+    # ---- diagnose_pose：好姿态必须"零问题"，否则判据形同虚设 ----
+    Z = np.zeros(3)
+
+    def has(problems, kw):
+        return any(kw in p for p in problems)
+
+    check_eq("理想 +z 无问题", cd.diagnose_pose("+z", np.array([0.0, 0.0, 1.0]), Z), [])
+    check_eq("理想 -x 无问题", cd.diagnose_pose("-x", np.array([-1.0, 0.0, 0.0]), Z), [])
+
+    p = cd.diagnose_pose("+z", np.array([0.0, 0.0, -1.0]), Z)
+    check("diagnose：**符号反了**被抓（`-z` 当成 `+z`）", has(p, "符号反了"), p)
+
+    p = cd.diagnose_pose("+z", np.array([1.0, 0.0, 0.0]), Z)
+    check("diagnose：主分量轴不对被抓（说 +z 其实躺着）", has(p, "主分量落在"), p)
+
+    p = cd.diagnose_pose("+z", np.array([0.2, 0.0, 0.98]), Z)
+    check("diagnose：侧轴残留被抓（倾斜 12° → 0.2 g 跑到 X）", has(p, "残留"), p)
+
+    p = cd.diagnose_pose("+z", np.array([0.0, 0.0, 0.9]), Z)
+    check("diagnose：主分量幅值偏离 1 g 被抓，且不误报轴错",
+          has(p, "偏离 1 g") and not has(p, "主分量落在"), p)
+
+    p = cd.diagnose_pose("+z", np.array([0.0, 0.0, 1.0]), np.array([0.0, 0.0, 0.05]))
+    check("diagnose：轴内 σ 超限（采集时手还在动）被抓", has(p, "板子在动"), p)
+
+    # ---- solve：理想六姿态 → k=1 / b=0 ----
+    ideal = {}
+    for name, j, s in cd.POSES:
+        v = [0.0, 0.0, 0.0]
+        v[j] = float(s)
+        ideal[name] = np.asarray(v)
+
+    sol = cd.solve(ideal)
+    check("solve：理想数据还原 k=1", bool(np.allclose(sol["k"], 1.0, atol=1e-12)), sol["k"])
+    check("solve：理想数据还原 b=0", bool(np.allclose(sol["b_g"], 0.0, atol=1e-12)), sol["b_g"])
+
+    # ---- solve：注入已知 k/b，必须**精确还原** ----
+    # 物理模型 R = k · a_true + b，**零偏作用于每个轴**（真值为 0 时读数就是 b）。
+    K, B = 1.025, 0.012                     # 增益 +2.5%；零偏 +0.012 g ≈ 197 LSB
+    raw = {}
+    for name, j, s in cd.POSES:
+        v = np.full(3, B)
+        v[j] = K * s + B
+        raw[name] = v
+
+    sol2 = cd.solve(raw)
+    check("solve：精确还原注入增益 k=%.3f" % K,
+          bool(np.allclose(sol2["k"], K, atol=1e-12)), sol2["k"])
+    check("solve：精确还原注入零偏 b=%.3f g" % B,
+          bool(np.allclose(sol2["b_g"], B, atol=1e-12)), sol2["b_g"])
+    check("solve：b_lsb = b_g × 16384（对得上固件口径）",
+          abs(sol2["b_lsb"][0] - B * vf.ACCEL_LSB_PER_G) < 1e-9, sol2["b_lsb"])
+    check("solve：raw_plus 记的是该轴朝上时的读数",
+          abs(sol2["raw_plus"][0] - (K + B) * vf.ACCEL_LSB_PER_G) < 1e-9, sol2["raw_plus"])
+
+    # ---- apply_calib：(R-b)/k 应把注入数据修回 |a| = 1 ----
+    stack_raw = np.vstack([raw[p] for p in cd.POSE_NAMES])
+    fixed = cd.apply_calib(stack_raw, sol2)
+    check("apply_calib：把注入的 6 姿态幅值修回 1 g",
+          bool(np.allclose(np.sqrt((fixed ** 2).sum(axis=1)), 1.0, atol=1e-12)),
+          np.sqrt((fixed ** 2).sum(axis=1)))
+
+    # ---- dev_pct：判据函数的算术 ----
+    check_eq("dev_pct：|a|=1 → 0%", cd.dev_pct(np.array([[0.0, 0.0, 1.0]])), (0.0, 0.0))
+    d = cd.dev_pct(np.array([[0.0, 0.0, 1.02]]))
+    check("dev_pct：|a|=1.02 → +2%",
+          abs(d[0] - 2.0) < 1e-9 and abs(d[1] - 2.0) < 1e-9, d)
+    dm, dx = cd.dev_pct(np.array([[0.0, 0.0, 1.01], [0.0, 0.0, 0.98]]))
+    check("dev_pct：多样本取均值(-0.5%)与最大绝对偏差(2%)",
+          abs(dm + 0.5) < 1e-9 and abs(dx - 2.0) < 1e-9, (dm, dx))
+    raw_mean, raw_max = cd.dev_pct(stack_raw)
+    fix_mean, fix_max = cd.dev_pct(fixed)
+    check("dev_pct：标定前均值 +2.514% / 最大 +3.714%，标定后归零（自洽，不是验证）",
+          abs(raw_mean - 2.51405) < 1e-4 and abs(raw_max - 3.71394) < 1e-4
+          and abs(fix_mean) < 1e-12 and abs(fix_max) < 1e-12,
+          (raw_mean, raw_max, fix_mean, fix_max))
+
+    # ---- poses_from_json ----
+    check("poses_from_json：6 姿态齐",
+          sorted(cd.poses_from_json(
+              {"poses": {p: {"mean_g": list(raw[p])} for p in cd.POSE_NAMES}}))
+          == sorted(cd.POSE_NAMES))
+    check_eq("poses_from_json：跳过没有 mean_g 的记录（不抛异常）",
+             cd.poses_from_json({"poses": {"+x": {"n": 3}}}), {})
+
+    # ---- solve 的两条拒绝路径 ----
+    try:
+        cd.solve({k: v for k, v in ideal.items() if k != "+z"})
+        check("solve：缺姿态抛 ValueError", False, "没抛异常")
+    except ValueError as e:
+        check("solve：缺姿态抛 ValueError", "缺少姿态" in str(e), str(e))
+
+    bad = dict(ideal)
+    bad["+x"] = np.array([0.2, 0.0, 0.0])
+    bad["-x"] = np.array([0.9, 0.0, 0.0])   # 两次都朝"正" → k 变负
+    try:
+        cd.solve(bad)
+        check("solve：增益越界抛 ValueError（姿态摆反的信号）", False, "没抛异常")
+    except ValueError as e:
+        check("solve：增益越界抛 ValueError（姿态摆反的信号）", "增益" in str(e), str(e))
+
+    # ---- render_c_header ----
+    hdr = cd.render_c_header(sol2, {"solved_at": "TEST"})
+    check("render_c_header：含头保护", "#ifndef MPU6050_CALIB_H" in hdr)
+    check("render_c_header：K/B 六个宏齐全",
+          all(("MPU6050_CALIB_%s_%s" % (a, b)) in hdr
+              for a in ("K", "B") for b in ("X", "Y", "Z")))
+
+    # ---- run_solve：离线端到端（含导出）+ 拒算 + JSON 往返 ----
+    tmp = tempfile.mkdtemp(prefix="calib_test_")
+    try:
+        doc = {"tool": "calib_dev.py", "poses": {}}
+        for p in cd.POSE_NAMES:
+            doc["poses"][p] = {"mean_g": [float(v) for v in raw[p]],
+                               "sigma_g": [0.0, 0.0, 0.0], "n": 30,
+                               "text_mode": "raw", "problems": []}
+
+        cpath = os.path.join(tmp, "mpu6050_calib.h")
+        check_eq("run_solve：6 姿态齐 → 退出码 0", cd.run_solve(doc, emit_c=cpath), 0)
+        check("run_solve：写入了 doc['solved']", "solved" in doc)
+        ctext = open(cpath, encoding="utf-8").read() if os.path.exists(cpath) else ""
+        check("run_solve：导出的 C 头文件落地且含宏",
+              "MPU6050_CALIB_K_X" in ctext and "MPU6050_CALIB_B_Z" in ctext)
+
+        doc_bad = {"poses": {p: dict(doc["poses"][p]) for p in cd.POSE_NAMES}}
+        doc_bad["poses"]["+z"]["problems"] = ["符号反了"]
+        check_eq("run_solve：有姿态未通过 → 退出码 2（拒算）",
+                 cd.run_solve(doc_bad, emit_c=None), 2)
+
+        jpath = os.path.join(tmp, "calib.json")
+        cd.save_doc(jpath, doc)
+        back = cd.load_doc(jpath)
+        check("save_doc/load_doc：往返后 solved.k 不变",
+              bool(np.allclose(back["solved"]["k"], K, atol=1e-12)), back["solved"]["k"])
+        check("save_doc：不把内部 `_path` 写进 JSON",
+              "_path" not in open(jpath, encoding="utf-8").read())
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- run_verify 的早退（没 solved 就不该碰串口）----
+    import argparse as _ap
+    check_eq("run_verify：没有 solved 字段 → 直接退 2（不碰串口）",
+             cd.run_verify(_ap.Namespace(json="nope.json"), {}), 2)
+
+    # ---- CLI 冒烟 ----
+    check_eq("CLI：--emit-c 缺 --solve → 退出码 2", cd.main(["--emit-c", "x.h"]), 2)
+    smoke = os.path.join(tempfile.gettempdir(), "calib_smoke_%d.json" % os.getpid())
+    if os.path.exists(smoke):
+        os.remove(smoke)
+    check_eq("CLI：--solve 面对不存在的 json → 退出码 2",
+             cd.main(["--solve", "--json", smoke]), 2)
+
+
 def main() -> int:
     print("=" * 68)
     print("stm32-edge-ai-node · PC 端数据链路自测（不需要硬件）")
@@ -1071,6 +1261,7 @@ def main() -> int:
     t_blade_peak()
     t_pwm_sweep()
     t_pwm_cmd()
+    t_calib()
 
     print("\n" + "=" * 68)
     print("结果：%d 通过 / %d 失败" % (_pass, _fail))
