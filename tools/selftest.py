@@ -1240,6 +1240,21 @@ def t_calib():
     check("explain_serial_error：认不出的异常 → 仍带口名与原消息",
           "COM5" in other and "怪事" in other, other)
 
+    # ---- _unbuffer_stdout：非终端下也必须"逐行出" ----
+    # ⚠️ 这里**不**用"计时子进程"做判据 —— 实测（2026-10-13）无论用管道还是文件、
+    # 无论开不开 write_through，测到的都是"进程退出时刻"，探针分辨不出差别
+    # （连 Python 默认不缓冲的 stderr 也一样），说明是**读法**在骗人，不是子进程没 flush。
+    # 所以改成判据更直接、更能证伪的一条：调用后 stdout 的属性本身必须是开的。
+    # 端到端的效果另用真机跑 `--watch` 后台验证（修前 13 s 零输出 → 修后秒出）。
+    cd._unbuffer_stdout()
+    cd._unbuffer_stdout()                      # 幂等
+    check("calib_dev._unbuffer_stdout：调用后 stdout 行缓冲为 True",
+          bool(getattr(sys.stdout, "line_buffering", False)),
+          str(getattr(sys.stdout, "line_buffering", None)))
+    check("calib_dev._unbuffer_stdout：同时开 write_through（`end=''` 的进度点也立刻出）",
+          bool(getattr(sys.stdout, "write_through", False)),
+          str(getattr(sys.stdout, "write_through", None)))
+
     # ---- short_problem / watch_line：实时刷新那一行 ----
     check_eq("short_problem：符号反", cd.short_problem("**符号反了**：az 轴实测 -1.0 g"), "符号反")
     check_eq("short_problem：侧轴残留", cd.short_problem("侧轴 ax 残留 +0.2000 g 超过 0.080 g"), "侧轴残留")
@@ -1336,6 +1351,64 @@ def t_calib():
              cd.main(["--solve", "--json", smoke]), 2)
 
 
+def t_serial_pacing():
+    """[18] `serial_source` 必须「在缓冲里有多少读多少」，不能拿 `chunk` 死等。
+
+    🔴 这是 2026-10-13 真机抓到的**隐性失真**：老实现 `ser.read(chunk)` 在 Windows 上
+    会一直等到攒够 `chunk=4096` 字节才返回，而 115200 下 mode 0 只有 1365 B/s ⇒
+    攒满要 **3 秒** ⇒ `--seconds` / `--interval` / `idle_timeout` 三个时间旋钮全失真
+    （`--interval 1.0` 实测每 4 秒才刷一行）。
+
+    证伪方式：把 `serial` 模块换成桩（`serial_source` 是**延迟导入**，所以能注入），
+    让 `in_waiting` 依次报 10 / 4 / 0，然后**检查 `read()` 实际被请求了多少字节**。
+    老实现会请求 4096，新实现必须是 10 / 4 / 1。
+    """
+    import types
+
+    asks = []          # 记录 read(n) 的 n
+    made = []          # 构造串口时的参数
+
+    class FakeSer:
+        def __init__(self, *a, **k):
+            made.append((a, k))
+            self.i = 0
+
+        @property
+        def in_waiting(self):
+            return (10, 4, 0)[self.i] if self.i < 3 else 0
+
+        def read(self, n):
+            asks.append(n)
+            self.i += 1
+            return b"x" * n          # 有多少返多少（0 则返空）
+
+        def close(self):
+            pass
+
+    fake = types.ModuleType("serial")
+    fake.Serial = FakeSer
+    had = sys.modules.get("serial")
+    sys.modules["serial"] = fake
+    try:
+        got = b"".join(vs.serial_source("COMx", 115200, duration=0.02, verbose=False))
+    finally:
+        if had is None:
+            sys.modules.pop("serial", None)
+        else:
+            sys.modules["serial"] = had
+
+    check("serial_source：按 in_waiting 取数（10/4），而不是拿 chunk 死等 4096",
+          asks[:2] == [10, 4], asks[:5])
+    check("serial_source：缓冲为空时阻塞读 1 字节（靠 timeout=0.2 兜底，循环不卡死）",
+          asks[2] == 1, asks[:5])
+    check("serial_source：每个 chunk 都不超过 chunk 上限",
+          all(n <= 4096 for n in asks), sorted(set(asks))[-3:])
+    check("serial_source：total 字节数 = 桩返回的字节数",
+          len(got) == sum(asks), (len(got), sum(asks)))
+    check("serial_source：串口以 timeout=0.2 打开（idle 判据的粒度来自它）",
+          made and made[0][1].get("timeout") == 0.2, made[:1])
+
+
 def main() -> int:
     print("=" * 68)
     print("stm32-edge-ai-node · PC 端数据链路自测（不需要硬件）")
@@ -1360,6 +1433,7 @@ def main() -> int:
     t_pwm_sweep()
     t_pwm_cmd()
     t_calib()
+    t_serial_pacing()
 
     print("\n" + "=" * 68)
     print("结果：%d 通过 / %d 失败" % (_pass, _fail))

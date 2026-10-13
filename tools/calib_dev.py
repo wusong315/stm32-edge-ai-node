@@ -964,7 +964,30 @@ def resolve_port(args) -> tuple[str | None, int]:
     return port, 0
 
 
+def _unbuffer_stdout() -> None:
+    """让 stdout 在**非终端**（管道 / 重定向 / 被别的程序抓）下也逐行输出。
+
+    为什么需要：Python 只在 stdout **是终端**时才行缓冲；是管道时改成 4~8 KB 块缓冲。
+    `--watch` 这类"无限刷新的实时视图"每行才几十字节，于是**一屏都攒不满** ⇒
+    屏幕上**一行都不出现**，看起来像卡死。实测（2026-10-13）：后台跑 `--watch`
+    13 s、零输出，而同一时刻串口数据明明在流 —— 正是"0 字节先怀疑观察链路"那条
+    纪律的镜像版本：**别把"自己的输出被缓冲了"误判成"设备没数据"**。
+
+    终端下本来就是行缓冲，所以对"双击 `watch.cmd`"这个主场景无影响（幂等、无副作用）。
+
+    ⚠️ 只给 `line_buffering=True` **不够** —— 它仅在写入 `\\n` 时才 flush，而本工具
+    里还有 `print("  3…", end="")` 这种**不带换行**的倒数进度（`pause_before_capture`）。
+    所以同时开 `write_through=True`（2026-10-13 自测探针实测：只给 line_buffering 时
+    \"写了 5 字节但不带换行\"仍要等到进程退出才可见）。
+    """
+    try:
+        sys.stdout.reconfigure(line_buffering=True, write_through=True)   # Py 3.7+
+    except Exception:                                   # noqa: BLE001
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _unbuffer_stdout()
     args = build_parser().parse_args(argv)
 
     if args.list_ports:

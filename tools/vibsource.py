@@ -51,6 +51,18 @@ def serial_source(port: str, baud: int = 115200, *, chunk: int = 4096,
     """从串口读字节流。
 
     duration 为 None 时一直读到 Ctrl-C 或串口静默超过 idle_timeout 秒。
+
+    🔴 **读多少由「在缓冲里有多少」决定，绝不用 `chunk` 死等**（2026-10-13 修正）。
+    老实现写成 `ser.read(chunk)`，但 pyserial 在 Windows 上会**一直等到攒够 `chunk`
+    字节**才返回 ⇒ 实测 115200 下 mode 0 只有 **1365 B/s**，攒满 `chunk=4096` 要
+    **3 秒**！后果是**三个时间旋钮全部失真**：
+      · `--seconds 4` 实际是"读满一个 4096 块"，与 4 秒无关；
+      · 实时视图 `--interval 1.0` 实际每 **4 秒**才刷一行；
+      · `idle_timeout` 最短也只能按 3 秒级粒度生效。
+    这也解释了为什么 `--identify --seconds 4` 恰好拿到 `4096 字节 / 40 样本` ——
+    那不是"采了 4 秒"，是"读满了一块"，数字对上纯属巧合。
+    现在改成按 `in_waiting` 取：有数据就立刻拿走，没数据用 `read(1)` 让
+    `timeout=0.2` 兜底（于是循环最长 0.2 s 一轮，三个旋钮都恢复按时钟工作）。
     """
     import serial  # 延迟导入：只解析文件时不需要串口库
 
@@ -61,7 +73,10 @@ def serial_source(port: str, baud: int = 115200, *, chunk: int = 4096,
     last_data = time.time()
     try:
         while True:
-            data = ser.read(chunk)
+            want = ser.in_waiting
+            # 有货就按实际数量取（不超过 chunk）；没货就 blocking 读 1 字节，
+            # 靠 timeout 兜底 —— 这样循环节奏跟得上时钟，而不是跟得上缓冲区大小。
+            data = ser.read(min(chunk, want) if want else 1)
             now = time.time()
             if data:
                 last_data = now
