@@ -15,6 +15,9 @@
 
 跑法::
 
+    # 🔴 先问它「我现在拿的是哪个面」—— 不用自己对着丝印猜
+    python calib_dev.py --port COM5 --identify
+
     # 单姿态（一次摆一个，可分批做）
     python calib_dev.py --port COM5 --pose +z
 
@@ -192,6 +195,53 @@ def diagnose_pose(pose: str, mean: np.ndarray, sigma: np.ndarray,
     return problems
 
 
+def identify_pose(mean: np.ndarray, sigma: np.ndarray | None = None,
+                  *, static_tol: float = DEFAULT_STATIC_TOL,
+                  off_tol: float = DEFAULT_OFF_TOL,
+                  mag_tol: float = DEFAULT_MAG_TOL):
+    """由**一次静止读数**反推「现在拿的是哪个面」，返回 ``(pose, problems, info)``。
+
+    存在的理由：六姿态的名字（`+x`/`-z`…）是**相对芯片自己的坐标系**说的，而手上
+    的板子只有一行丝印 —— 让用户"照着文字猜方向"是最容易把姿态说错的地方。所以
+    先采一段、让工具报出它认出的姿态，人只需确认"是不是这样"。
+
+    * ``pose`` = 推断的姿态名；读数太斜（主分量 < 0.7 g）时**返回 None**（不猜）
+    * ``problems`` = 拿这个推断去跑 `diagnose_pose` 的结果（空 = 干净）
+    * ``info`` = ``{"axis","sign","mag_g","raw_lsb"}``，供打印用
+
+    ⚠️ 判据只认两件事：**主分量落在哪个轴** 与 **符号**。这两条恰好是用户最容易
+    弄错的两条，也正是本工具能替他判定的两条 —— 其余（幅值/残留/静止）由
+    `diagnose_pose` 归入 `problems`。
+    """
+    m = np.asarray(mean, dtype=np.float64).reshape(3)
+    j = int(np.argmax(np.abs(m)))
+    sign = 1 if m[j] >= 0 else -1
+    pose = ("+" if sign > 0 else "-") + AXES[j][1:]
+    info = {
+        "axis": j,
+        "sign": sign,
+        "mag_g": float(np.sqrt(float((m ** 2).sum()))),
+        "raw_lsb": [float(v) * vf.ACCEL_LSB_PER_G for v in m],
+    }
+    sig = np.zeros(3) if sigma is None else np.asarray(sigma, dtype=np.float64)
+    problems = diagnose_pose(pose, m, sig, static_tol=static_tol,
+                             off_tol=off_tol, mag_tol=mag_tol)
+    # 主分量不足 0.7 g ⇒ 大概率是斜着拿/还在动，"认定某个面"就是猜 ⇒ 干脆不猜
+    if abs(float(m[j])) < 0.7:
+        return None, problems, info
+    return pose, problems, info
+
+
+def usable_poses(doc: dict) -> list[str]:
+    """从标定文件里挑出**已经采过且判据全过**的姿态（按 `POSE_NAMES` 顺序）。"""
+    out = []
+    for p in POSE_NAMES:
+        rec = (doc.get("poses") or {}).get(p)
+        if rec and not rec.get("problems"):
+            out.append(p)
+    return out
+
+
 def solve(pose_means: dict[str, np.ndarray]) -> dict:
     """由 6 个姿态的均值解出每轴 k/b；缺姿态或增益离谱时抛 ValueError。
 
@@ -296,11 +346,12 @@ def capture(port: str, baud: int, seconds: float, *, quiet: bool = False):
     return mean, sigma, int(s.shape[0]), tp.mode, nbytes
 
 
-def wait_for_user(pose: str, *, auto: bool, countdown: float, quiet: bool) -> None:
-    """提示用户摆好姿态，然后（回车 或 倒数）放行。"""
+def pause_before_capture(note: str, *, auto: bool, countdown: float,
+                         quiet: bool) -> None:
+    """打印提示，然后（回车 或 倒数）放行。`wait_for_user` 的通用版。"""
     print("\n" + "-" * 68)
-    print("姿态 **%s** ：%s" % (pose, POSE_HINT[pose]))
-    print("摆好后**不要用手扶**（松手让它静止），再开始采集。")
+    for line in note.splitlines():
+        print(line)
     if auto:
         for i in range(int(max(1, countdown)), 0, -1):
             print("  %d…" % i, end="", flush=True)
@@ -308,11 +359,19 @@ def wait_for_user(pose: str, *, auto: bool, countdown: float, quiet: bool) -> No
         print(" 开始")
     else:
         try:
-            input("  → 摆好后按回车开始采集：")
+            input("  → 准备好后按回车开始采集：")
         except EOFError:
             print("  [i] 非交互环境（stdin 已结束），直接开始")
     if not quiet:
         print("  采集中…")
+
+
+def wait_for_user(pose: str, *, auto: bool, countdown: float, quiet: bool) -> None:
+    """提示用户摆好某个姿态，然后（回车 或 倒数）放行。"""
+    pause_before_capture(
+        "姿态 **%s** ：%s\n摆好后**不要用手扶**（松手让它静止），再开始采集。"
+        % (pose, POSE_HINT.get(pose, "")),
+        auto=auto, countdown=countdown, quiet=quiet)
 
 
 def capture_pose(args, pose: str, doc: dict) -> tuple[bool, str]:
@@ -500,6 +559,76 @@ def render_c_header(solved: dict, doc: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def run_identify(args, doc: dict) -> int:
+    """采一段，告诉用户「现在拿的是哪个面」，并指出下一步该摆哪个。
+
+    这是六姿态流程的**入口**：姿态名是相对芯片自己坐标系说的，而板子上只有一行
+    丝印 —— 让用户照着文字猜方向，正是最容易出错的地方。所以先让工具报出它认出
+    的姿态，人只需点头。
+    """
+    print("=" * 68)
+    print("姿态识别：随便摆一个面，让工具告诉你它是哪个（不用对着丝印猜）")
+    print("=" * 68)
+    print("把板子**按任意一个面摆正、松手静止**（不要用手扶）。任意一面都行 ——")
+    print("识别不需要你先知道它是哪个面。")
+
+    pause_before_capture("准备开始识别。", auto=args.yes, countdown=args.countdown,
+                         quiet=args.quiet)
+    try:
+        mean, sigma, n, tmode, nbytes = capture(args.port, args.baud, args.seconds,
+                                                quiet=args.quiet)
+    except Exception as e:                                     # noqa: BLE001
+        print("[ERROR] 采集失败：%s" % e)
+        return 2
+    if n < args.min_samples:
+        print("[ERROR] 只解出 %d 个样本（%d 字节）—— 见 --pose 的排查清单。" % (n, nbytes))
+        return 2
+
+    pose, problems, info = identify_pose(
+        mean, sigma, static_tol=args.static_tol, off_tol=args.off_tol,
+        mag_tol=args.mag_tol)
+    done = usable_poses(doc)
+
+    print("\n  样本 %d 个（%d 字节，文本模式 %r）" % (n, nbytes, tmode))
+    print("  均值 LSB  ax=%+.0f  ay=%+.0f  az=%+.0f   |a| = %.4f g   最大轴内 σ = %.4f g"
+          % (info["raw_lsb"][0], info["raw_lsb"][1], info["raw_lsb"][2],
+             info["mag_g"], float(np.max(sigma))))
+
+    if pose is None:
+        print("\n  ❓ **认不出来**：三个轴都没到 0.7 g —— 板子没落在任何一个面上。")
+        print("     可能：斜着拿 / 采集时还在动 / 传感器根本没出数。摆平、松手，再来一次。")
+        for p in problems:
+            print("       - %s" % p)
+        return 1
+
+    print("\n  你现在拿着的姿态是：**%s**" % pose)
+
+    if problems:
+        print("  ⚠️ 但这次读数有 %d 项不符 —— 先别采，按提示摆正：" % len(problems))
+        for p in problems:
+            print("       - %s" % p)
+        print("\n  → 摆正后再跑一次 `--identify`；也可以直接 `--guided`"
+              "（它逐个提示并要求你确认，摆错会拒收）。")
+        return 1
+
+    print("  ✅ 四项判据（主分量轴 / 符号 / 幅值 / 残留 / 静止）全过 —— 可以直接采它：")
+    print("       python calib_dev.py --port %s --pose %s" % (args.port, pose))
+    if pose in done:
+        print("\n  📌 这个姿态**之前已经采过**（且已通过），再采会覆盖旧记录。")
+
+    print("\n  六姿态进度：%d / 6%s" % (len(done),
+                                       ("   已过：%s" % " ".join(done)) if done else ""))
+    rest = [p for p in POSE_NAMES if p not in done and p != pose]
+    if rest:
+        print("  还差：%s" % " ".join(rest))
+        print("  → 建议下一个摆 **%s**：%s" % (rest[0], POSE_HINT[rest[0]]))
+    elif pose in done:
+        print("  🎉 六个姿态齐了 → python calib_dev.py --solve --json %s" % args.json)
+    else:
+        print("  → 采下这个姿态后，六个就齐了。")
+    return 0
+
+
 def run_verify(args, doc: dict) -> int:
     """独立验证：任意姿态新采一段，比较标定前后的 |a| 偏差。"""
     solved = doc.get("solved")
@@ -606,6 +735,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--pose", choices=POSE_NAMES,
                     help="采单个姿态（可分批做，结果累积在 --json 里）")
     ap.add_argument("--guided", action="store_true", help="依次提示 6 个姿态")
+    ap.add_argument("--identify", action="store_true",
+                    help="🔴 采一段并告诉你「现在拿的是哪个面」（不用对着丝印猜）")
     ap.add_argument("--solve", action="store_true", help="解算（不碰硬件，读 --json）")
     ap.add_argument("--verify", action="store_true",
                     help="独立验证：任意姿态采集，比较标定前后 |a| 偏差")
@@ -646,17 +777,22 @@ def main(argv: list[str] | None = None) -> int:
         print("[ERROR] --emit-c 需要配合 --solve")
         return 2
 
+    if not args.port:
+        print("[ERROR] 需要 --port（或 --list-ports / --solve / --identify）")
+        print("        例：python calib_dev.py --port COM5 --identify")
+        print("        例：python calib_dev.py --port COM5 --guided")
+        return 2
+
+    if args.identify:
+        doc = load_doc(args.json)      # 只读：用来看"六姿态还差几个"
+        return run_identify(args, doc)
+
     if args.verify:
         doc = load_doc(args.json)
         rc = _run_verify_hardware(args, doc)
         doc["_path"] = args.json
         save_doc(args.json, doc)
         return rc
-
-    if not args.port:
-        print("[ERROR] 需要 --port（或 --list-ports / --solve）")
-        print("        例：python calib_dev.py --port COM5 --guided")
-        return 2
 
     doc = load_doc(args.json)
     doc["_path"] = args.json

@@ -1170,6 +1170,43 @@ def t_calib():
     check_eq("poses_from_json：跳过没有 mean_g 的记录（不抛异常）",
              cd.poses_from_json({"poses": {"+x": {"n": 3}}}), {})
 
+    # ---- identify_pose：由一次读数反推「现在拿的是哪个面」----
+    for name, j, s in cd.POSES:
+        v = [0.0, 0.0, 0.0]
+        v[j] = float(s)
+        got, probs, _ = cd.identify_pose(np.asarray(v))
+        check_eq("identify_pose：理想 %s → 认出 %r 且无问题" % (name, name),
+                 (got, probs), (name, []))
+
+    got, probs, _ = cd.identify_pose(np.array([0.2, 0.0, 0.98]))
+    check("identify_pose：斜着拿仍认出 +z，但报出侧轴残留",
+          got == "+z" and has(probs, "残留"), (got, probs))
+
+    got, _, info = cd.identify_pose(np.array([0.4, 0.4, 0.45]))
+    check("identify_pose：主分量 < 0.7 g → 返回 None（不猜）",
+          got is None and abs(info["mag_g"] - np.sqrt(0.4 ** 2 * 2 + 0.45 ** 2)) < 1e-9,
+          (got, info))
+
+    got, _, info = cd.identify_pose(np.array([0.0, -1.0, 0.0]))
+    check("identify_pose：-y 的轴与符号都要对",
+          (got, info["axis"], info["sign"]) == ("-y", 1, -1), (got, info))
+
+    _, _, info = cd.identify_pose(np.array([0.0, 0.0, 1.0]))
+    check("identify_pose：raw_lsb 按 16384 LSB/g 换算",
+          abs(info["raw_lsb"][2] - vf.ACCEL_LSB_PER_G) < 1e-9, info["raw_lsb"])
+
+    got, probs, _ = cd.identify_pose(np.array([0.0, 0.0, 1.0]),
+                                     np.array([0.0, 0.0, 0.05]))
+    check("identify_pose：把轴内 σ 传进去 → 报出「板子在动」",
+          got == "+z" and has(probs, "板子在动"), probs)
+
+    # ---- usable_poses ----
+    dp = {"poses": {"+x": {"problems": []}, "-x": {"problems": ["符号反了"]},
+                    "+y": {"problems": []}}}
+    check_eq("usable_poses：只收判据全过的，且按 POSE_NAMES 顺序",
+             cd.usable_poses(dp), ["+x", "+y"])
+    check_eq("usable_poses：空文件 → 空列表", cd.usable_poses({}), [])
+
     # ---- solve 的两条拒绝路径 ----
     try:
         cd.solve({k: v for k, v in ideal.items() if k != "+z"})
@@ -1231,6 +1268,8 @@ def t_calib():
 
     # ---- CLI 冒烟 ----
     check_eq("CLI：--emit-c 缺 --solve → 退出码 2", cd.main(["--emit-c", "x.h"]), 2)
+    check("--help 含 --identify", "--identify" in cd.build_parser().format_help())
+    check_eq("CLI：--identify 缺 --port → 退出码 2", cd.main(["--identify"]), 2)
     smoke = os.path.join(tempfile.gettempdir(), "calib_smoke_%d.json" % os.getpid())
     if os.path.exists(smoke):
         os.remove(smoke)

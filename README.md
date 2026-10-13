@@ -52,7 +52,7 @@
 | 采集 | TIM2 中断 1 kHz 采样 + 环形发送队列 + 四档输出模式 | ✅ **已上板实测（±0.01 %）** |
 | printf | `__io_putchar` 重定向 + 浮点打印（`-u _printf_float`） | ✅ 完成 |
 | 稳健性 | **I²C 总线自愈**（SCL 打脉冲踢从机回 idle）+ 诊断打印 | ✅ **已上板实测（免复位恢复）** |
-| PC 工具 | 帧解析 / 切窗 / CSV / 频谱 / 门禁 / 节拍 / PWM 扫频与命令（**8 个工具，228 条自测全绿**） | ✅ 完成 |
+| PC 工具 | 帧解析 / 切窗 / CSV / 频谱 / 门禁 / 节拍 / PWM 扫频与命令 / 六姿态标定（**9 个工具，285 条自测全绿**） | ✅ 完成 |
 | 模型 | NanoEdge AI 库集成链路（链接 + 4 API + 1 kHz 在线推理档） | 🟡 链路已打通并上板运行（**当前为占位库**，待训练真模型） |
 | 振动源 | 电机 + 桨叶 + PWM 限速（第 ⑦ 步固件侧已完成） | 🟡 固件就绪，**功率驱动模块待到货** |
 | 数据集 | 正常 / 异常各 50 段 CSV | ⬜ 待功率驱动到货 |
@@ -146,7 +146,7 @@ stm32-edge-ai-node/
 ├── Drivers/
 │   ├── CMSIS/               # ARM CMSIS 内核与设备头文件
 │   └── STM32F4xx_HAL_Driver/   # ST HAL 库
-├── tools/                   # PC 端数据工具（Python，8 个 + README.md）
+├── tools/                   # PC 端数据工具（Python，9 个 + README.md）
 │   ├── vibframe.py          #   协议层：二进制帧编解码 + 解析统计
 │   ├── vibsource.py         #   来源层：串口 / 离线文件，统一成一条样本流
 │   ├── parse_frames.py      #   CLI：串口 → 连续序列 → 切窗 → CSV
@@ -154,7 +154,8 @@ stm32-edge-ai-node/
 │   ├── check_blade_peak.py  #   频谱门禁：转频/叶频定位 + 噪声上界 + 谐波守卫
 │   ├── check_pwm_cmd.py     #   PWM 占空比命令工具（--set / --led-test / --hold）
 │   ├── pwm_sweep.py         #   扫占空比选档，把叶频压进器件带宽
-│   ├── selftest.py          #   228 条自测（不需要硬件）
+│   ├── calib_dev.py         #   六姿态静态标定（--identify 认姿态 / --solve / --verify）
+│   ├── selftest.py          #   285 条自测（不需要硬件）
 │   └── README.md            #   各工具用法 + 帧格式 + 健康度读法 + 排查顺序
 ├── .settings/               # STM32CubeIDE 工程设置
 ├── stm32-edge-ai-node.ioc      # CubeMX 配置文件（改配置从这里改）
