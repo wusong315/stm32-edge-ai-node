@@ -71,6 +71,32 @@
  * 详见 App_PumpUart() 上方的注释。 */
 #define TXQ_CHUNK           (4U)
 
+/* =====================================================================
+ * 第 ⑦ 步：PWM 限速通道（PA6 = TIM3_CH1）
+ * =====================================================================
+ * 为什么需要它（依据 R17）：MPU6050 的加速度计带宽上限只有 260 Hz，而 3 V 直驱时
+ * 叶频 = 3 × 转频 = 3 × 136.7 = 410.2 Hz —— **落在器件带宽之外**，
+ * 结果是"频率位置可信、绝对幅值不可信"。PWM 把转速压下来之后，
+ * 1×/2×/3× 全部落进 260 Hz 以内，位置和幅值同时变可信。
+ * 另一条降速路线（1 节电芯 + 空槽跨接 ≈ 1.5 V）已放弃 —— 见 RUNBOOK R6.4。
+ *
+ * 硬件前置（缺一不可，见 RUNBOOK R6.4 第 ⑦ 步）：
+ *   ① 必须共地：IRF520N 模块 GND ↔ STM32 GND ↔ 电池盒负极
+ *   ② 电机两端并续流二极管（1N4148/1N5819，**阴极接电机 +**）
+ *   ③ 电机供电仍走电池盒（3 V）—— 🔴 **不要接 5V 排针**
+ *
+ * 参数：TIM3 挂在 APB1（84 MHz）→ 84e6 / (0+1) / (4199+1) = 20.0 kHz。
+ *   取 20 kHz 是为了**避开可听噪声**；PSC 取 0 让占空比分辨率做到 1/4200。
+ * 🔴 上电默认占空比 = 0（电机不转）—— 接线还没确认时上电不应该转起来。 */
+#define APP_PWM_PSC          (0U)
+#define APP_PWM_ARR          (4199U)     /* 84 MHz / 4200 = 20.0 kHz */
+#define APP_PWM_DUTY_DEFAULT (0U)        /* 上电占空比（0..100，单位 %） */
+
+/* 串口命令（走 USART1 = PA10，即已经接着的那根 CH340 线，**不需要加线**）：
+ *   `dNN` + 回车 → 把占空比设为 NN%（0..100，超过按 100 处理）
+ *   `?`   + 回车 → 回报当前占空比
+ * 只用一个字母 + 最多 3 位十进制，够用且不引入 sscanf（省 Flash）。 */
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -146,6 +172,32 @@ static uint16_t g_frame_seq     = 0;   /* 帧序号 */
 static uint32_t g_frame_dropped = 0;   /* 因丢拍而作废的半帧数 */
 #endif /* APP_OUTPUT_MODE == 2 */
 
+/* =====================================================================
+ * PWM 限速（第 ⑦ 步）—— 参数来历见 USER CODE BEGIN PD
+ * =====================================================================
+ * ⚠️ **这里的 TIM3 是手写的，不是 CubeMX 生成的**，这是有意的：
+ *    本工程 `.cproject` 里有手工加的 `-L Core/Src -lneai` 与
+ *    `nanoprintffloat`（`-u _printf_float`），让 CubeMX 重新 GENERATE CODE
+ *    会把这些一起覆盖掉 —— 代价比手写这 40 行大得多。
+ *    手写版全部落在 USER CODE 区内，**CubeMX 重新生成也丢不了**。
+ *    将来若要在 CubeMX 里正式加 TIM3：请把下面这一整段（PV/0/2 三处）
+ *    删掉，改用生成的 `htim3`，**别让两套初始化同时存在**（会重复配置同一个外设）。*/
+static TIM_HandleTypeDef  htim3_pwm;                            /* 🔴 特意不叫 htim3 */
+static uint8_t            g_pwm_duty = (uint8_t)APP_PWM_DUTY_DEFAULT;  /* 当前占空比 % */
+
+/* ---- 串口命令接收状态（USART1 单字节中断）---------------------------
+ * 中断里**只攒字符**，真正的动作（改占空比 / 打印）由主循环的 App_PollCmd() 执行。
+ * 分工理由与采样节拍完全一样：中断里干的活越少越好。
+ * 这几个变量跨中断与主循环 → 必须 volatile。 */
+#define APP_CMD_NONE   (0U)
+#define APP_CMD_DUTY   (1U)
+#define APP_CMD_INFO   (2U)
+static volatile uint8_t   s_rx_byte   = 0U;   /* HAL_UART_Receive_IT 的落点 */
+static volatile uint8_t   s_cmd_kind  = APP_CMD_NONE;
+static volatile uint8_t   s_cmd_val   = 0U;   /* 累积到的数值 */
+static volatile uint8_t   s_cmd_digit = 0U;   /* 本行已收到几位数字（最多 3 位） */
+static volatile uint8_t   s_cmd_ready = 0U;   /* 1 = 有一整条命令待主循环处理 */
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -164,6 +216,10 @@ static void     App_EnsureSensor(void);
 static uint16_t App_TxqFree(void);
 static void     App_EmitFrame(void);
 #endif
+static void     App_PwmInit(void);
+static void     App_SetDuty(uint8_t pct);
+static void     App_CmdRxStart(void);
+static void     App_PollCmd(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -242,15 +298,192 @@ static uint16_t App_TxqFree(void)
 #endif
 
 /* =====================================================================
- * 二、上电自检 / 掉线重连
+ * 二、I2C 总线体检（只在探测失败时打印一次）
+ * ===================================================================== */
+
+/* 为什么需要它：`id=0x00` 这一个现象**同时**覆盖四种成因，而四者的修法没有交集 ——
+ *   ① SDA/SCL 没接通（线掉了 / 插错孔）      → 查线
+ *   ② SDA/SCL 被钉在 GND（短接 / 器件坏）    → 拔线二分定位
+ *   ③ AD0 没接 GND，器件改在 0x69 上应答     → 把 AD0 接地
+ *   ④ 器件本体或供电有问题                   → 换模块 / 换供电
+ * 光盯着串口看 `id=0x00` 是分不出来的，人只能在四个方向上瞎试。下面三项检查
+ * 把它的覆盖面切开，每一项都对应一条能判否的判据：
+ *   A. 空闲电平 —— I2C 是**开漏**，读 IDR 拿到的就是线上真实电平；空闲时必须两条都为 1。
+ *   B. 两个候选地址各探一次 —— 0x68(AD0=GND) / 0x69(AD0=VCC)。
+ *   C. 全总线扫描 —— 确认总线上到底有没有**任何**器件在应答。
+ * 结论由 A/B/C 的组合唯一推出。这是把"排错"从猜测变成判据的那一步。 */
+static void App_I2cDiag(void)
+{
+  uint8_t          sda0, scl0, sda1, scl1;
+  uint8_t          ack68, ack69, hits = 0U;
+  uint8_t          id = 0U;
+  uint8_t          a;
+  uint32_t         err68;
+  mpu6050_status_t wst;
+
+  printf("\r\n[DIAG] ===== I2C1 总线体检 =====\r\n");
+
+  /* ---- A. 软复位**前**的空闲电平（先取样，再复位）---- */
+  sda0 = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_SET) ? 1U : 0U;
+  scl0 = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_SET) ? 1U : 0U;
+
+  /* 上一轮失败的传输可能把外设留在"未发 STOP 的 BUSY 态"。
+   * 🔴 不软复位的话，后面的探测会一律返回 HAL_BUSY ——
+   *    读出来的"无应答"是**假阳性**，会把排查引向完全错误的方向。
+   *    （这正是本项目踩过的坑：把"没数据"错判成接线问题。） */
+  MX_I2C1_Init();
+
+  sda1 = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_SET) ? 1U : 0U;
+  scl1 = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_SET) ? 1U : 0U;
+
+  printf("[DIAG] A) 空闲电平 SDA(PB7)=%u SCL(PB6)=%u （空闲必须 1/1）\r\n",
+         (unsigned)sda1, (unsigned)scl1);
+  if ((sda0 != sda1) || (scl0 != scl1))
+  {
+    printf("[DIAG]    软复位前是 %u/%u → 复位后 %u/%u：是外设没释放总线，不是硬件短接\r\n",
+           (unsigned)sda0, (unsigned)scl0, (unsigned)sda1, (unsigned)scl1);
+  }
+
+  /* ---- B. 两个候选地址各探一次（HAL 要 8 位地址 = 7bit << 1）---- */
+  ack68 = (HAL_I2C_IsDeviceReady(&hi2c1, MPU6050_ADDR_HAL, 3U, 20U) == HAL_OK) ? 1U : 0U;
+  err68 = hi2c1.ErrorCode;
+  ack69 = (HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(MPU6050_ADDR_HAL + 2U), 3U, 20U) == HAL_OK) ? 1U : 0U;
+  printf("[DIAG] B) 探测 0x68(AD0=GND) ACK=%u | 0x69(AD0=VCC) ACK=%u | 0x68 ErrCode=0x%04lX\r\n",
+         (unsigned)ack68, (unsigned)ack69, (unsigned long)err68);
+
+  wst = MPU6050_WhoAmI(&hi2c1, &id);
+  printf("[DIAG]    WHO_AM_I 状态=%u 回读=0x%02X（期望 0x68）\r\n",
+         (unsigned)wst, (unsigned)id);
+
+  /* ---- C. 全总线扫描：总线上到底有没有器件在应答 ---- */
+  for (a = 0x08U; a < 0x78U; a++)
+  {
+    if (HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)((uint16_t)a << 1), 1U, 5U) == HAL_OK)
+    {
+      printf("[DIAG] C) 总线应答 @7bit=0x%02X\r\n", (unsigned)a);
+      hits++;
+    }
+  }
+  printf("[DIAG] C) 扫描 0x08~0x77：共 %u 个应答\r\n", (unsigned)hits);
+
+  /* ---- D. 判读：把四种成因收敛到一个 ---- */
+  if ((sda1 == 0U) || (scl1 == 0U))
+  {
+    printf("[DIAG] D) >> 空闲时有一条线是低电平 → 该线被**钉在 GND**。\r\n");
+    printf("[DIAG]      拔掉 MPU 那束线再复位：电平回到 1/1 → 短接在 MPU 侧；\r\n");
+    printf("[DIAG]      仍是 0 → 短接在主板侧（相邻孔搭一起 / 焊锡桥）。\r\n");
+  }
+  else if (ack68 != 0U)
+  {
+    printf("[DIAG] D) >> 器件在 0x68 上应答，**接线是通的** → 问题在上拉/速率/时序，别再去动线。\r\n");
+  }
+  else if (ack69 != 0U)
+  {
+    printf("[DIAG] D) >> 器件在 **0x69** 上应答 → `AD0` 没接到 GND（悬空或被拉高）。把 AD0 接 GND 即可。\r\n");
+  }
+  else if (hits != 0U)
+  {
+    printf("[DIAG] D) >> 0x68/0x69 都不应答，但总线上**有别的器件** → SDA/SCL 是通的，问题在 MPU 本体或其供电。\r\n");
+  }
+  else
+  {
+    printf("[DIAG] D) >> 全总线**无任何应答** → SDA/SCL 至少有一条没接通。\r\n");
+    printf("[DIAG]      重点核对 MPU 的 SDA→PB7、SCL→PB6（这两根最容易插错孔 / 插偏）。\r\n");
+  }
+  printf("[DIAG] ===== 体检结束 =====\r\n\r\n");
+}
+
+/* =====================================================================
+ * 三、I2C 总线恢复（每次探测失败都做）
+ * ===================================================================== */
+
+/* 🔴 这一段是**实测踩出来的**，不是预防性设计。
+ *
+ * 现象：电机一转，MPU6050 掉线（`id=0x00`）；把电机停了、线也重插到供电灯亮起，
+ *       固件**仍然**报 `[WAIT]`，直到按一次复位才恢复 —— 两读之间硬件没变，
+ *       所以真正被锁死的是**固件侧的 I2C 外设状态**，不是接线。
+ *
+ * 掉线有两种，恢复动作不同，只做其中一种都会漏：
+ *   ① 外设停在 BUSY / 上一笔传输没走完 STOP
+ *      → HAL 拿到 BUSY 会**直接返回 HAL_BUSY，根本不去碰总线**。
+ *        于是"每秒重试一次"的重连逻辑永远失败 —— 它重试的是同一个坏状态。
+ *      → 软复位外设即可。
+ *   ② 从机被"钉住"（在半个字节上被打断，SCL 松开后它仍把 SDA 拉低）
+ *      → 此时 START 都发不出来，软复位也没用；必须在 SCL 上补最多 9 个时钟
+ *        把从机的移位寄存器走完，再补一个 STOP 让它释放。
+ *
+ * ⚠️ 这是"掉线重连"代码最典型的缺口：**只重试、不恢复**。
+ *    现场（尤其是 OTA 之后）没有人能按复位键，一次电磁扰动就永久失联。
+ *    本项目的重连必须自愈，否则"预测性维护"这个卖点不成立。 */
+static void App_I2cBusRecover(void)
+{
+  GPIO_InitTypeDef gi = {0};
+  uint8_t          i;
+  uint8_t          stuck;
+
+  /* ① 外设级复位。
+   * 用 DeInit + MX_I2C1_Init 两件套，**不能只调 MX_I2C1_Init**：
+   * HAL_I2C_Init 只在 State==RESET 时才调 HAL_I2C_MspInit，而 MspInit
+   * 才是把 PB6/PB7 配成 AF4 的地方。DeInit 把 State 置回 RESET 并释放引脚，
+   * 下一次 Init 才会重新配 AF —— 少了这步，引脚会停在手动拉线的状态。 */
+  (void)HAL_I2C_DeInit(&hi2c1);
+  MX_I2C1_Init();
+
+  /* ② 总线释放了吗？空闲时两条线都应为高（靠上拉）。 */
+  stuck = ((HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_RESET) ||
+           (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_RESET)) ? 1U : 0U;
+  if (stuck == 0U)
+  {
+    return;                       /* 情形 ① 已解决，不用补时钟 */
+  }
+
+  /* ③ 补时钟：把 SCL/SDA 临时切成开漏输出，手动打脉冲。 */
+  gi.Pin   = GPIO_PIN_6 | GPIO_PIN_7;
+  gi.Mode  = GPIO_MODE_OUTPUT_OD;
+  gi.Pull  = GPIO_PULLUP;          /* 开漏得有上拉才回得到高电平 */
+  gi.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(GPIOB, &gi);
+
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);    /* 先释放 SDA */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
+  HAL_Delay(1);
+
+  for (i = 0U; i < 9U; i++)
+  {
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
+    HAL_Delay(1);
+    if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_SET)
+    {
+      break;                      /* 从机已释放 SDA，不必再补 */
+    }
+  }
+
+  /* ④ 补一个 STOP：SCL 高电平时把 SDA 由低拉高。 */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
+  HAL_Delay(1);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+  HAL_Delay(1);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);
+  HAL_Delay(1);
+
+  /* ⑤ 引脚交还 I2C 外设（同样走 DeInit + Init，理由见 ①）。 */
+  (void)HAL_I2C_DeInit(&hi2c1);
+  MX_I2C1_Init();
+}
+
+/* =====================================================================
+ * 四、上电自检 / 掉线重连
  * ===================================================================== */
 
 /* 探测 MPU6050。硬件没插好时每秒重试一次并在串口打印提示，
  * 方便第一次上板时对着终端排查接线（这是最能省时间的几行代码）。 */
 static void App_EnsureSensor(void)
 {
-  static uint8_t  s_first = 1U;
-  static uint32_t s_last  = 0U;
+  static uint8_t  s_first     = 1U;
+  static uint8_t  s_diag_done = 0U;   /* 总线体检只打一次，避免每秒刷屏 */
+  static uint32_t s_last      = 0U;
   mpu6050_status_t st;
 
   if (g_sensor_ok != 0U)
@@ -269,6 +502,7 @@ static void App_EnsureSensor(void)
   if (st == MPU6050_OK)
   {
     g_sensor_ok = 1U;
+    s_diag_done = 0U;   /* 掉线后再次失败时，体检要能重跑 */
     printf("[OK] MPU6050 online (WHO_AM_I=0x68), 1kHz sampling starts\r\n");
   }
   else
@@ -277,11 +511,21 @@ static void App_EnsureSensor(void)
     (void)MPU6050_WhoAmI(&hi2c1, &id);   /* 顺便把实际读到的 id 打出来 */
     printf("[WAIT] MPU6050 not found (id=0x%02X). Check wiring: "
            "VCC=3V3 GND SDA=PB7 SCL=PB6 AD0=GND\r\n", (unsigned)id);
+
+    if (s_diag_done == 0U)
+    {
+      s_diag_done = 1U;
+      App_I2cDiag();   /* 首次失败才体检：一次给出定因，不是每秒刷屏 */
+    }
+
+    /* 🔴 每次失败都要恢复总线，下一次重试才有机会成功。
+     * 只重试不恢复 = 反复去读同一个坏掉的外设 → 永久失联。 */
+    App_I2cBusRecover();
   }
 }
 
 /* =====================================================================
- * 三、采样分派：每次新拍到，按当前输出模式处理一点
+ * 五、采样分派：每次新拍到，按当前输出模式处理一点
  * ===================================================================== */
 
 /* 把“主循环已消费到第几拍”对齐到当前拍，并把 lost 清零。
@@ -516,6 +760,191 @@ static void App_EmitFrame(void)
 }
 #endif /* APP_OUTPUT_MODE == 2 */
 
+/* =====================================================================
+ * 二、PWM 限速通道（第 ⑦ 步）—— PA6 = TIM3_CH1
+ * =====================================================================
+ * 为什么需要 PWM、20 kHz 怎么来的、硬件三项前置 —— 见 USER CODE BEGIN PD。
+ * 为什么手写而不是让 CubeMX 生成 —— 见 USER CODE BEGIN PV。 */
+
+/* 配置并启动 TIM3_CH1 的 PWM 输出。
+ * 🔴 下面三件事在"CubeMX 生成"模式下由 MspInit 代劳，手写时**必须自己补**：
+ *    ① **开 TIM3 时钟** —— HAL_TIM_PWM_Init() 自己不碰 RCC，而生成的
+ *       stm32f4xx_hal_msp.c 里 HAL_TIM_Base_MspInit() 只认 TIM2（TIM3 不在 .ioc 里）。
+ *       不开时钟的话所有寄存器写入都被丢弃、PA6 恒为低 —— 现象是"代码跑了但电机不转"，
+ *       特别容易被误判成"MOS 坏了"。**这是本函数里最容易漏的一步。**
+ *    ② **把 PA6 配成 AF2** —— 复位后 PA6 不是复用态，HAL 不会替你配。
+ *    ③ 用宏 __HAL_RCC_TIM3_CLK_ENABLE()（零开销）而不是 HAL_RCC_...()。 */
+static void App_PwmInit(void)
+{
+  GPIO_InitTypeDef   gpio = {0};
+  TIM_OC_InitTypeDef oc   = {0};
+
+  __HAL_RCC_TIM3_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();          /* MX_GPIO_Init 已开过，重复调用无害 */
+
+  /* PA6 → AF2（F407 上 AF2 = TIM3/TIM4/TIM5 的复用组）
+   * ⚠️ PA6 的其它可能复用：AF0=SPI1、AF1=TIM13。这里要的是 **AF2 = TIM3_CH1**。
+   * Speed 选 LOW 是**故意的**：20 kHz 根本用不着翻转速率，边沿越缓，
+   * 向旁边那根 MPU6050 排线辐射的开关噪声越小 —— R6.4 记录的 I2C 掉线
+   * 就发生在电机开关那一瞬（感性浪涌），降速之后这类耦合只会更容易发作。 */
+  gpio.Pin       = GPIO_PIN_6;
+  gpio.Mode      = GPIO_MODE_AF_PP;
+  gpio.Pull      = GPIO_NOPULL;
+  gpio.Speed     = GPIO_SPEED_FREQ_LOW;
+  gpio.Alternate = GPIO_AF2_TIM3;
+  HAL_GPIO_Init(GPIOA, &gpio);
+
+  htim3_pwm.Instance               = TIM3;
+  htim3_pwm.Init.Prescaler         = APP_PWM_PSC;
+  htim3_pwm.Init.CounterMode       = TIM_COUNTERMODE_UP;
+  htim3_pwm.Init.Period            = APP_PWM_ARR;
+  htim3_pwm.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
+  htim3_pwm.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim3_pwm) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  oc.OCMode     = TIM_OCMODE_PWM1;
+  oc.Pulse      = 0U;                    /* 先给 0%，实际值由下面的 App_SetDuty 定 */
+  oc.OCPolarity = TIM_OCPOLARITY_HIGH;
+  oc.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3_pwm, &oc, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Start(&htim3_pwm, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  App_SetDuty((uint8_t)APP_PWM_DUTY_DEFAULT);
+}
+
+/* 设置占空比（0..100，单位 %）；超过 100 一律按 100 处理。
+ * 换算 CCR = (ARR+1) × pct / 100 —— 用 ARR+1（而不是 ARR）是为了让 pct=100 时
+ * CCR = 4200 > ARR = 4199：PWM 模式 1 下计数器永远追不上比较值 ⇒ 输出恒高，
+ * 也就是**真正的 100%**（用 ARR 的话会留一个计数周期的低电平缺口）。 */
+static void App_SetDuty(uint8_t pct)
+{
+  uint32_t ccr;
+
+  if (pct > 100U)
+  {
+    pct = 100U;
+  }
+  g_pwm_duty = pct;
+  ccr = (((uint32_t)APP_PWM_ARR + 1U) * (uint32_t)pct) / 100U;
+  __HAL_TIM_SET_COMPARE(&htim3_pwm, TIM_CHANNEL_1, ccr);
+}
+
+/* 打开 USART1 的"收"：单字节中断，每收到 1 字节回调一次。
+ * 🔴 这里是**唯一**手工打开 NVIC 的地方 —— `.ioc` 里没有配置 USART1 中断，
+ *    所以 CubeMX 不会生成 HAL_NVIC_EnableIRQ(USART1_IRQn)。
+ *    抢占优先级取 2（TIM2 = 0、USART3 = 1），保证 1 kHz 采样节拍永远最优先。 */
+static void App_CmdRxStart(void)
+{
+  HAL_NVIC_SetPriority(USART1_IRQn, 2U, 0U);
+  HAL_NVIC_EnableIRQ(USART1_IRQn);
+  (void)HAL_UART_Receive_IT(&huart1, (uint8_t *)&s_rx_byte, 1U);
+}
+
+/* UART 收满一个字节的回调（**中断上下文** —— 别在这里 printf、别在这里改寄存器）。
+ * 解析规则故意做得又笨又松，用串口工具手打也不会崩：
+ *   'd' / 'D'                → 这是一条"设占空比"命令
+ *   数字                      → 累积成数值（最多 3 位，防溢出）
+ *   CR / LF / 空格 / , / ;    → 一条命令结束，置 s_cmd_ready 交主循环
+ *   '?' / 'h' / 'H'          → 这是一条"查状态"命令
+ *   其它                      → 忽略（顺手吃掉串口工具的 ANSI 转义残渣）
+ * 🔴 处理完必须**重新装机**，否则下一次就再也不进中断了（经典坑）。 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  uint8_t b;
+
+  if (huart->Instance != USART1)
+  {
+    return;                             /* 别的串口的回调，本项目不管 */
+  }
+  b = s_rx_byte;
+
+  if ((b >= (uint8_t)'0') && (b <= (uint8_t)'9'))
+  {
+    if (s_cmd_kind == APP_CMD_NONE)
+    {
+      s_cmd_kind = APP_CMD_DUTY;        /* 光敲数字也当"设占空比" */
+    }
+    if (s_cmd_digit < 3U)
+    {
+      s_cmd_val   = (uint8_t)((s_cmd_val * 10U) + (uint8_t)(b - (uint8_t)'0'));
+      s_cmd_digit = (uint8_t)(s_cmd_digit + 1U);
+    }
+  }
+  else if ((b == (uint8_t)'d') || (b == (uint8_t)'D'))
+  {
+    s_cmd_kind = APP_CMD_DUTY;
+  }
+  else if ((b == (uint8_t)'?') || (b == (uint8_t)'h') || (b == (uint8_t)'H'))
+  {
+    s_cmd_kind = APP_CMD_INFO;
+  }
+  else if ((b == (uint8_t)'\r') || (b == (uint8_t)'\n') || (b == (uint8_t)' ') ||
+           (b == (uint8_t)',')  || (b == (uint8_t)';'))
+  {
+    if (s_cmd_kind != APP_CMD_NONE)
+    {
+      s_cmd_ready = 1U;                 /* 交给主循环执行 */
+    }
+  }
+  else
+  {
+    /* 忽略 */
+  }
+
+  (void)HAL_UART_Receive_IT(&huart1, (uint8_t *)&s_rx_byte, 1U);
+}
+
+/* 在主循环里执行"待处理命令"（没有命令时立刻返回，不占节拍）。
+ * 🔴 **模式 2 下不打印任何字符** —— 那会把 0xAA 0x55 的二进制流搅乱。
+ *    想知道命令有没有生效：看电机声音变了没有，或看 PC 端 1× 频率动没动。 */
+static void App_PollCmd(void)
+{
+  uint8_t kind, val, digit;
+
+  if (s_cmd_ready == 0U)
+  {
+    return;
+  }
+
+  /* 先把状态取走并清干净，再执行 —— 免得执行期间来了新命令被吞掉 */
+  kind  = s_cmd_kind;
+  val   = s_cmd_val;
+  digit = s_cmd_digit;
+
+  s_cmd_kind  = APP_CMD_NONE;
+  s_cmd_val   = 0U;
+  s_cmd_digit = 0U;
+  s_cmd_ready = 0U;
+
+  if ((kind == APP_CMD_DUTY) && (digit > 0U))
+  {
+    App_SetDuty(val);
+#if (APP_OUTPUT_MODE != 2)
+    printf("[PWM] duty = %u%%\r\n", (unsigned)g_pwm_duty);
+#endif
+  }
+  else if (kind == APP_CMD_INFO)
+  {
+#if (APP_OUTPUT_MODE != 2)
+    printf("[PWM] duty = %u%%  (PA6/TIM3_CH1 @20 kHz; cmd: dNN, NN = 0..100)\r\n",
+           (unsigned)g_pwm_duty);
+#endif
+  }
+  else
+  {
+    /* 空命令（只敲了个回车）或没带数字的 'd'：什么也不做 */
+  }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -553,6 +982,15 @@ int main(void)
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
 
+  /* ---- 第 ⑦ 步：PWM 限速通道（PA6 = TIM3_CH1，上电占空比 0 = 电机不转）--
+   * 🔴 必须在 USB/电池盒接好、MOS 接线确认之后才把占空比调上去；
+   *    上电默认 0 是安全默认值，见 USER CODE BEGIN PD。 */
+  App_PwmInit();
+
+  /* ---- 打开 USART1 收中断：PC 可以发 "dNN" 实时改转速 ---------------
+   * 用的是已经接好的 CH340（PA10），**不需要额外加线**。 */
+  App_CmdRxStart();
+
   /* ---- 开场横幅（全部走发送队列，立即返回，不阻塞启动）------------- */
   printf("\r\n\r\n=== stm32-edge-ai-node boot ===\r\n");
   printf("SYSCLK = %lu Hz, I2C1 = 400 kHz, TIM2 = 1 kHz\r\n",
@@ -567,6 +1005,15 @@ int main(void)
 #elif (APP_OUTPUT_MODE == 3)
   printf("mode 3: on-device inference @1 kHz (NanoEdge AI, similarity + us)\r\n");
 #endif
+
+  /* 第 ⑦ 步的 PWM 状态 —— 一行说清"在哪儿、多少 Hz、当前占空比"。
+   * 频率这里**算出来**而不是写死，免得改了 PSC/ARR 之后横幅说假话。
+   * 🔴 启动横幅全部堆在 1024 B 的发送队列里、此时主循环还没开始倒，
+   *    所以这一行也要克制（超了会丢字节，看 ovf 计数）。 */
+  printf("PWM: PA6/TIM3_CH1 @%lu Hz, duty=%u%% (USART1 cmd: dNN + Enter)\r\n",
+         (unsigned long)(84000000UL /
+                         (((uint32_t)APP_PWM_PSC + 1UL) * ((uint32_t)APP_PWM_ARR + 1UL))),
+         (unsigned)g_pwm_duty);
 
   /* ---- 初始化 NanoEdge AI -------------------------------------------
    * 🔴 无论当前是哪个输出模式都初始化一次，有两个好处：
@@ -600,15 +1047,17 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* 主循环三件事，按“越频繁越靠前”排：
+    /* 主循环四件事，按“越频繁越靠前”排：
      *   1) 倒串口 —— 每次只吐 4 字节，保证 1 ms 采样节拍不被拖垮；
      *   2) 处理采样 —— 有新拍才动，没新拍立刻返回；
-     *   3) 传感器掉线重连 —— 没事时也立刻返回。
+     *   3) 传感器掉线重连 —— 没事时也立刻返回；
+     *   4) 执行串口命令（第 ⑦ 步：改 PWM 占空比）—— 没命令时立刻返回。
      * 设计上这里**没有 HAL_Delay / 阻塞等待**，主循环全速空转，
      * 因此采样抖动只取决于 I2C 与串口的实际耗时之和。 */
     App_PumpUart();
     App_OnTick();
     App_EnsureSensor();
+    App_PollCmd();
 
     /* USER CODE END WHILE */
 

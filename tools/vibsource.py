@@ -24,12 +24,25 @@ import vibframe as vf
 # 1) 串口
 # ---------------------------------------------------------------------------
 def list_serial_ports() -> list[str]:
-    """列出可用串口。没装 pyserial 时返回空列表（不抛异常）。"""
+    """列出可用串口。没装 pyserial 时返回空列表（不抛异常）。
+
+    🔴 要带上 description 与 VID:PID —— 插了不止一个适配器时（例如 ST-Link 的
+       虚拟串口 + CH340），只报 "COM5" 根本分不出是哪一个；而**选错端口**的
+       现象（收不到数据）和**接线故障**一模一样，会把排查引向错误方向。
+    """
     try:
         from serial.tools import list_ports
     except ImportError:
         return []
-    return ["%s" % p.device for p in list_ports.comports()]
+    out = []
+    for p in list_ports.comports():
+        extra = []
+        if p.description:
+            extra.append(p.description)
+        if p.vid is not None and p.pid is not None:
+            extra.append("%04X:%04X" % (p.vid, p.pid))
+        out.append("%s%s" % (p.device, "  [" + " | ".join(extra) + "]" if extra else ""))
+    return out
 
 
 def serial_source(port: str, baud: int = 115200, *, chunk: int = 4096,
@@ -192,6 +205,10 @@ class TextParser:
         self.bad_lines = 0
         self.comment_lines = 0
         self.rows: list[tuple[float, float, float]] = []
+        # 🔴 收到的**原始字节数**，由采集层填入。报告里必须显示它：
+        #    "0 行" 既可能是"解析口径不对"，也可能是"一个字节都没收到"——
+        #    这两者的排查方向完全相反，不能靠猜。
+        self.bytes_in = 0
 
     def _parse_line(self, line: str):
         s = line.strip()

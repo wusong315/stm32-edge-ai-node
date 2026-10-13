@@ -26,6 +26,8 @@ import vibframe as vf
 import vibsource as vs
 import check_rate as cr
 import check_blade_peak as cb
+import pwm_sweep as ps
+import check_pwm_cmd as cpc
 
 _fail = 0
 _pass = 0
@@ -300,6 +302,170 @@ def t_text_parsers():
     check_eq("文本按 7 字符切分后行数不变", total, 200)
 
 
+def t_text_rate_agreement():
+    """🔴 采样率必须由**解析器实际识别到的** mode 决定，而不是 CLI 开关。
+
+    回归用例来自真实踩到的一个坑：`--text` 但不给 `--text-raw`，打在 mode 0 的
+    真实固件输出上 —— 解析器照样认出 40 行，但报告会打出「mode 0 → 原始整数」
+    的标签 + 「200 Hz」的数字（**自相矛盾**），CSV 的 `t_s` 列整体错 **20 倍**。
+    而 `check_blade_peak.load_csv()` 正是**从 `t_s` 反推采样率**的 —— 错会一路传下去。
+    """
+    print("\n[10b] 文本档采样率口径（回归：报告自相矛盾 / 时间轴错 20 倍）")
+    import parse_frames as pf
+
+    # ① 开关说 mode 1（200 Hz），实测是 mode 0 → 必须改成 10 Hz 并给警告
+    rate, warn = pf.reconcile_text_rate(pf.RATE_TEXT_G, False, "raw")
+    check_eq("开关给 200 Hz、实测 mode 0 → 速率改成 10 Hz",
+             rate, pf.RATE_TEXT_RAW)
+    check("不一致时必须给出警告文案", bool(warn), repr(warn))
+
+    # ② 一致时不打扰用户
+    rate2, warn2 = pf.reconcile_text_rate(pf.RATE_TEXT_RAW, True, "raw")
+    check_eq("一致时速率不变", rate2, pf.RATE_TEXT_RAW)
+    check("一致时不给警告", warn2 is None, repr(warn2))
+
+    # ③ 反方向：开关说 mode 0、实测是 mode 1 → 改成 200 Hz
+    rate3, warn3 = pf.reconcile_text_rate(pf.RATE_TEXT_RAW, True, "g")
+    check_eq("开关给 10 Hz、实测 mode 1 → 速率改成 200 Hz",
+             rate3, pf.RATE_TEXT_G)
+    check("反方向也要警告", bool(warn3), repr(warn3))
+
+    # ④ 一行都没认出来（parser.mode 仍是 None）→ 保持原样，别瞎改
+    rate4, warn4 = pf.reconcile_text_rate(pf.RATE_TEXT_G, False, None)
+    check_eq("未识别出 mode 时不改速率", rate4, pf.RATE_TEXT_G)
+    check("未识别出 mode 时不给警告", warn4 is None, repr(warn4))
+
+    # ⑤ 端到端：mode 0 文本走 CLI，**故意不给 --text-raw**，时间轴必须覆盖真实时长
+    import contextlib
+    import io
+
+    with tempfile.TemporaryDirectory() as td:
+        raw = os.path.join(td, "m0.txt")
+        with open(raw, "w", encoding="utf-8") as fh:
+            fh.write(vs.make_fake_text(seconds=4.0, rate=10, mode="raw",
+                                       banner="\r\nmode 0: debug text @10 Hz\r\n"))
+        csv_path = os.path.join(td, "m0.csv")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            rc = pf.main(["--file", raw, "--text", "--csv", csv_path])
+        check_eq("CLI 退出码 0", rc, 0)
+        check("CLI 打出了『采样率改用 10 Hz』的警告", "10 Hz" in buf.getvalue(),
+              buf.getvalue()[-160:].replace("\n", " | "))
+        arr = np.genfromtxt(csv_path, delimiter=",", names=True)
+        n = int(np.size(arr["t_s"]))
+        span = float(arr["t_s"][-1]) if n else 0.0
+        check("CSV 点数 = 40", n == 40, "n=%d" % n)
+        check("CSV 时间轴覆盖 ≈3.9 秒（错档时只会是 0.195 秒）",
+              abs(span - 3.9) < 0.25, "span=%.3f" % span)
+
+
+def t_binary_zero_frame_hint():
+    """二进制档"0 帧但收到字节"时，必须把**固件的文本诊断**打出来。
+
+    回归用例来自真实踩到的一个坑：mode 2 在 MPU6050 缺席时不出帧，只反复打印
+    `[WAIT] MPU6050 not found (id=0x00). Check wiring: ...`。工具当时只报
+    "重同步丢弃 870 字节"，排查被引向 TX/RX 接线 —— 而原因固件早就写在字节里了。
+    """
+    print("\n[10c] 二进制 0 帧时的文本诊断（回归：固件的话就在字节里）")
+    import contextlib
+    import io
+
+    import parse_frames as pf
+
+    banner = (b"[WAIT] MPU6050 not found (id=0x00). Check wiring: VCC=3V3 GND "
+              b"SDA=PB7 SCL=PB6 AD0=GND\r\n") * 4
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        pf._print_text_hint(banner)
+    out = buf.getvalue()
+    check("固件的 [WAIT] 行被原样打出来", "MPU6050 not found" in out, out[:120])
+    check("提示里点出'传感器缺席'这类成因", "传感器缺席" in out, out[:200])
+
+    # 🔴 这条是"判据必须能判否"：真噪声不能被误报成"固件输出"
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        pf._print_text_hint(bytes(range(256)) * 2)
+    check("非文本字节不误报为固件输出", buf2.getvalue() == "",
+          buf2.getvalue()[:80])
+
+    buf3 = io.StringIO()
+    with contextlib.redirect_stdout(buf3):
+        pf._print_text_hint(b"")
+    check("空字节样本不打印任何东西", buf3.getvalue() == "",
+          buf3.getvalue()[:80])
+
+
+def t_big_drop_positions():
+    """🔴 固件停机 = 时间轴上的**隐形接缝**。
+
+    这一条是上板实测逼出来的：电机启动的电磁扰动把 I2C 打掉，固件停机去重试，
+    恢复后继续吐帧。于是**校验错 0 / 序号断档 0 —— 全绿**，
+    但 `t_s` 是按样本索引算的，那段壁钟被压缩掉了。
+    "帧有没有丢"和"时间有没有停"是两件事，前者查不出后者，所以必须单独判。"""
+    print("\n[12] 时间轴断点：大段丢弃必须记下位置")
+    import contextlib
+    import io
+    import parse_frames as pf
+
+    a = vs.make_fake_frames(seconds=0.096, rate=1000)            # 3 帧，seq 0..2
+    b = vs.make_fake_frames(seconds=0.096, rate=1000, seq0=3)    # 3 帧，seq 3..5
+    stall = (b"[WAIT] MPU6050 not found (id=0x00). Check wiring: "
+             b"VCC=3V3 GND SDA=PB7 SCL=PB6 AD0=GND\r\n") * 8
+    check("构造的停机文本 > 阈值", len(stall) >= vf.BIG_DROP_BYTES,
+          "len=%d" % len(stall))
+
+    p = vf.FrameParser()
+    frames = p.feed(a + stall + b)
+    p.finish()
+
+    check_eq("两侧各 3 帧都解出", len(frames), 6)
+    check_eq("校验错 0 —— 帧本身没坏", p.stats.checksum_errors, 0)
+    check_eq("序号断档 0 —— 停的是时间，不是帧计数", p.stats.seq_gaps, 0)
+    check_eq("记到 1 处大段丢弃", len(p.stats.big_drops), 1)
+    if len(p.stats.big_drops) == 1:
+        pos, n = p.stats.big_drops[0]
+        check_eq("断点位置 = 前 3 帧的样本数", pos, 96)
+        check_eq("丢弃字节数 = 停机文本长度", n, len(stall))
+
+    # 判据必须能判否：只是切坏几个字节（链路常态）绝不能报成"断点"。
+    p2 = vf.FrameParser()
+    p2.feed(a + b"XYZ" + b)
+    p2.finish()
+    check_eq("小段丢弃不报断点", len(p2.stats.big_drops), 0)
+    check("小段丢弃仍计入 resync_bytes", p2.stats.resync_bytes >= 3,
+          "resync=%d" % p2.stats.resync_bytes)
+
+    # 报告层：数据层记了位置，报告层不打出来等于白记（"有特征没断言 = 没覆盖"）。
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        pf.print_report_binary(p.stats, np.zeros((96, 3)), 1000.0, 10.0)
+    out = buf.getvalue()
+    check("报告打出「时间轴断点」", "时间轴断点" in out, out[:240])
+    check("报告打出「壁钟缺口」", "壁钟缺口" in out, out[:240])
+    check("报告把断点位置写成样本索引", "样本 96" in out, out[:400])
+
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        pf.print_report_binary(p2.stats, np.zeros((96, 3)), 1000.0, 0.15)
+    check("无断点时报告不打断点行", "时间轴断点" not in buf2.getvalue(),
+          buf2.getvalue()[:240])
+
+    # `--file` 离线重解析没有墙钟（seconds≈0）→ 不能打出"壁钟缺口"这种假数
+    # （第一版漏了这个守卫，实测打出 `壁钟缺口 -9.79 秒` —— 一眼假的数字）
+    buf4 = io.StringIO()
+    with contextlib.redirect_stdout(buf4):
+        pf.print_report_binary(p.stats, np.zeros((96, 3)), 1000.0, 0.002)
+    check("离线重解析不打印壁钟缺口（没有墙钟可测）",
+          "壁钟缺口" not in buf4.getvalue(), buf4.getvalue()[:240])
+
+    # 在线且缺口偏大 → 必须进"需要看的点"，不能只说 ✅ 未发现异常
+    buf5 = io.StringIO()
+    with contextlib.redirect_stdout(buf5):
+        pf.print_report_binary(p.stats, np.zeros((96, 3)), 1000.0, 0.6)
+    check("壁钟缺口偏大时给出警告", "壁钟缺口偏大" in buf5.getvalue(),
+          buf5.getvalue()[:400])
+
+
 def t_fake_physical_sanity():
     """假数据的物理合理性：静置时 az≈+1g、翻转后 az≈-1g。"""
     print("\n[11] 假数据的物理口径")
@@ -462,13 +628,19 @@ def t_blade_peak():
           "got=%.2f" % r180["axes"][1]["rot_hz"])
 
     # --- C) 选轴：只有 ay 有振动时，best_axis 必须是 ay 且只有它过 ---
+    # 注意必须连 1× 一起给：新语义下"叶频带那个峰要与 K×1× 自洽"才算通过，
+    # 只放一根叶频正弦会被谐波校验正确地判为"无法校验/不自洽"。
+    f_rot_ay = f_bin / 3.0                     # = 123·df ≈120.12 Hz，落在转频带
     s = rng.normal(0.0, 0.005, (n, 3))
-    s[:, 1] += 0.05 * np.sin(2.0 * np.pi * f_bin * np.arange(n) / rate)
+    s[:, 1] += (0.05 * np.sin(2.0 * np.pi * f_bin * np.arange(n) / rate)
+                + 0.20 * np.sin(2.0 * np.pi * f_rot_ay * np.arange(n) / rate))
     r = cb.analyse(s, rate)
     check_eq("best_axis 选中有振动的那一轴", r["best_axis"], "ay")
     check("只有 ay 过判据（ax/az 是噪声）",
           r["axes"][1]["blade_ok"] and not r["axes"][0]["blade_ok"]
           and not r["axes"][2]["blade_ok"])
+    check("ay 的叶频/转频比值 ≈3（谐波自洽）",
+          abs(r["axes"][1]["ratio"] - 3.0) < 0.06, "ratio=%.3f" % r["axes"][1]["ratio"])
 
     # --- D) 🔴 纯噪声的 SNR 上界：判据可信度的地基 ---
     # 1 段（1 秒）和 18 段（10 秒）各试 12 次，取最大值。
@@ -537,6 +709,84 @@ def t_blade_peak():
     check("detrend 把线性漂移压掉 >100 倍", d_after < d_before / 100.0,
           "before=%.4f after=%.6f" % (d_before, d_after))
 
+    # --- K) 🔴 谐波自洽：带内最大峰若是 2× 谐波，不许冒充叶频 ---
+    # 场景取自真实工况：1× 最强、2× 与 3× 同量级 ⇒ 只要叶频带下沿低于 2×，
+    # "带内最大幅值"就会挑中 2×，判据假通过。这是必须能判否的一条。
+    f1 = 154 * df          # 1× 转频 ≈150.4 Hz（落在默认转频带 100–220）
+    f2 = 308 * df          # 2× ≈300.8 Hz（正好落进默认叶频带 300–660）
+    f3 = 462 * df          # 3× ≈451.2 Hz（真叶频）
+    tk = np.arange(n) / rate
+
+    harm2 = np.zeros((n, 3))
+    harm2[:, 2] = (0.20 * np.sin(2.0 * np.pi * f1 * tk)
+                   + 0.03 * np.sin(2.0 * np.pi * f2 * tk))
+    r2 = cb.analyse(harm2, rate)
+    row2 = r2["axes"][2]
+    check_eq("2× 落进叶频带 → 被识破为 2 阶谐波", row2["harmonic"], 2)
+    check("这种情况下判**不通过**（2× 不许冒充叶频）",
+          (not row2["blade_ok"]) and row2["blade_harmonic"],
+          "ok=%s harm=%s ratio=%.2f"
+          % (row2["blade_ok"], row2["blade_harmonic"], row2["ratio"] or 0.0))
+    check_eq("整体结论也是不通过", r2["blade_ok"], False)
+    check_eq("闸门前的阈值判定本来是「通过」（说明确实是谐波校验救回来的）",
+             row2["blade_thresh_ok"], True)
+    check("给出「由 1× 反推」的建议叶频带 ≈3×150 Hz",
+          r2["blade_suggest_band"] is not None
+          and abs(r2["blade_suggest_band"][0] - 3 * f1) < 3 * f1 * 0.13,
+          "got=%r" % (r2["blade_suggest_band"],))
+
+    # 对照：真叶频（3×）在带里 → 必须通过，且比值 ≈3
+    harm3 = np.zeros((n, 3))
+    harm3[:, 2] = (0.20 * np.sin(2.0 * np.pi * f1 * tk)
+                   + 0.03 * np.sin(2.0 * np.pi * f3 * tk))
+    r3 = cb.analyse(harm3, rate)
+    row3 = r3["axes"][2]
+    check_eq("真叶频（3×）→ 谐波阶次 3", row3["harmonic"], 3)
+    check("真叶频（3×）→ 通过，且没被谐波校验误伤",
+          row3["blade_ok"] and not row3["blade_harmonic"],
+          "ratio=%.2f" % (row3["ratio"] or 0.0))
+
+    # 4 叶桨：叶频 = 4×，把 3× 当叶频同样该被识破
+    harm4 = np.zeros((n, 3))
+    harm4[:, 2] = (0.20 * np.sin(2.0 * np.pi * f1 * tk)
+                   + 0.03 * np.sin(2.0 * np.pi * f3 * tk))
+    r4 = cb.analyse(harm4, rate, blade_multiple=4.0)
+    check("blade-multiple=4 时，3× 的峰被识破为不匹配阶次",
+          r4["axes"][2]["blade_harmonic"] and not r4["axes"][2]["blade_ok"],
+          "harm=%s" % (r4["axes"][2]["harmonic"],))
+
+    # 🔴 带内那个峰既不是 K× 也不是低次谐波（比如环境峰）→ 同样必须否决。
+    # 这一条是真实踩过的坑：--rot-band 框歪了也会走到这里，所以"不自洽"必须一票否决，
+    # 否则 2× 会在转频带量错时照旧冒充叶频通过。
+    f_env = 410 * df       # 410.1 Hz 落在默认叶频带，与 1×（150.4）毫无整数倍关系
+    mis = np.zeros((n, 3))
+    mis[:, 2] = (0.20 * np.sin(2.0 * np.pi * f1 * tk)
+                 + 0.05 * np.sin(2.0 * np.pi * f_env * tk))
+    r5 = cb.analyse(mis, rate)
+    row5 = r5["axes"][2]
+    check_eq("410 Hz 环境峰：最近谐波阶次 → None", row5["harmonic"], None)
+    check("环境峰落进叶频带 → 被标为「不自洽」并否决",
+          row5["blade_inconsistent"] and not row5["blade_ok"]
+          and row5["blade_thresh_ok"],
+          "ratio=%.2f" % (row5["ratio"] or 0.0))
+    check_eq("整体结论：不通过", r5["blade_ok"], False)
+    check_eq("r5 记录了「有比值否决」", r5["any_ratio_veto"], True)
+
+    # 逃生开关：确认 1× 在器件上看不到时，可关掉否决权退回纯阈值判定
+    r5x = cb.analyse(mis, rate, harmonic_guard=False)
+    check("--no-harmonic-guard 时退回阈值判定（该峰确实过 SNR/幅值门限）",
+          r5x["axes"][2]["blade_ok"] and not r5x["any_ratio_veto"],
+          "ok=%s" % r5x["axes"][2]["blade_ok"])
+
+    check_eq("nearest_harmonic(2.02) == 2", cb.nearest_harmonic(2.02), 2)
+    check_eq("nearest_harmonic(3.09) == 3", cb.nearest_harmonic(3.09), 3)
+    check_eq("nearest_harmonic(2.40) 落不进任何阶次 → None",
+             cb.nearest_harmonic(2.40), None)
+    check_eq("nearest_harmonic(None) → None", cb.nearest_harmonic(None), None)
+    bb = cb.blade_band_for(150.0, 3.0)
+    check("blade_band_for(150) 覆盖 450 Hz",
+          bb is not None and bb[0] < 450.0 < bb[1], "got=%r" % (bb,))
+
     # --- J) 参数守卫 + CSV 读写 ---
     for name, fn in (("点数 < 64 要抛 ValueError",
                       lambda: cb.analyse(np.zeros((40, 3)), rate)),
@@ -575,6 +825,229 @@ def t_blade_peak():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def t_pwm_sweep():
+    """第 ⑦ 步 PWM 扫频（pwm_sweep.py 的纯逻辑：不做串口，只喂合成数据）。
+
+    🔴 这一节要证明的不是「能不能算出频率」，而是**判定顺序**：
+    先问 1× 可不可信 → 再问叶频在不在器件带宽内 → 最后才问叶频过不过判据。
+    顺序错了就会出现最危险的那种结论：叶频明明超出 260 Hz 带宽，
+    却因为频谱上看得见而被报成 OK（幅值已经不可信了）。
+    """
+    print("\n[15] PWM 扫频（pwm_sweep.py 的纯逻辑）")
+
+    rate = 1000.0
+    df = rate / cb.DEFAULT_NPERSEG          # ≈0.977 Hz
+    rng = np.random.default_rng(20261012)
+
+    def sig(f_rot, comps, n=6000):
+        """造一段"电机振动"：f_rot 是 1×，comps = {谐波倍数: 幅度 g}，只加在 ay 上。"""
+        t = np.arange(n) / rate
+        s = rng.normal(0.0, 0.0015, (n, 3))
+        for k, amp in comps.items():
+            s[:, 1] += amp * np.sin(2.0 * np.pi * (k * f_rot) * t)
+        return s
+
+    def run(f_rot, comps):
+        row = ps.eval_capture(sig(f_rot, comps), rate,
+                              rot_band=ps.DEFAULT_ROT_BAND,
+                              blade_band_wide=ps.DEFAULT_BLADE_BAND_WIDE,
+                              multiple=3.0, guard=True, bw=260.0)
+        return row
+
+    # --- A) --duties 的写法与越界都必须管住 ---------------------------------
+    check_eq("duties 逗号列表", ps.parse_duties("30,40,50"), [30.0, 40.0, 50.0])
+    check_eq("duties 区间步进 20:60:20", ps.parse_duties("20:60:20"), [20.0, 40.0, 60.0])
+    check_eq("duties 单点 55", ps.parse_duties("55"), [55.0])
+    for bad, why in (("110", "越界 >100"), ("", "空"), ("60:20:10", "上界 < 下界"),
+                     ("10:90:0", "步进为 0"), ("20:30:40:50", "区间字段数不对")):
+        try:
+            ps.parse_duties(bad)
+            check("duties 拒绝 %r（%s）" % (bad, why), False, "居然没抛错")
+        except ValueError:
+            check("duties 拒绝 %r（%s）" % (bad, why), True)
+
+    # --- B) 两处都过：1× = 80.1 Hz、叶频 = 240.2 Hz（< 260 Hz 带宽）--------
+    f80 = 82 * df                            # bin 对齐 → 测出来就是它
+    row = run(f80, {1: 0.20, 3: 0.05})
+    row["duty"] = 60.0
+    check("1× 定位（bin 对齐，误差 < 一个频率分辨单元）",
+          abs(row["rot_hz"] - f80) < df, "got=%.2f want=%.2f" % (row["rot_hz"], f80))
+    check("1× 过判据（SNR 与幅值两项）", row["rot_ok"],
+          "snr=%r" % row["rot_snr"])
+    check("叶频 240 Hz 未超出 260 Hz 带宽", row["blade_out_of_bw"] is False)
+    check_eq("判定 = OK", ps.classify(row), ps.VERDICT_OK)
+    check_eq("转速换算 = 1× × 60", round(row["rpm"]), round(f80 * 60))
+    # 🔑 两遍分析的关键性质：窄带下沿必须高于 2×，否则 2× 会顶替叶频（R6.4.4）
+    check("叶频窄带下沿 > 2×1×（从根上排除 2× 冒充）",
+          row["blade_band"][0] > 2.0 * row["rot_hz"],
+          "band=(%.1f,%.1f) 2x=%.1f" % (row["blade_band"][0], row["blade_band"][1],
+                                        2.0 * row["rot_hz"]))
+
+    # --- C) 叶频超带宽：必须是 !bw，**不能**因为"看得见"就报 OK ------------
+    f100 = 102 * df                          # 1× = 99.6 Hz → 叶频 298.9 Hz > 260
+    row = run(f100, {1: 0.20, 3: 0.05})
+    row["duty"] = 90.0
+    check("叶频超带宽被标出来", row["blade_out_of_bw"] is True)
+    check("超出量 == 叶频 − 260 Hz（用的是算出来的 K×1×，不是测出来的峰）",
+          abs(row["blade_over_bw_by"] - (3.0 * row["rot_hz"] - 260.0)) < 1e-6,
+          "got=%.2f" % (row["blade_over_bw_by"] or -1.0))
+    check_eq("判定 = !bw（**不是** OK）", ps.classify(row), ps.VERDICT_BLADE_BW)
+
+    # --- D) 只有 1×、没有叶频 → !blade（说明这一档还不够干净）---------------
+    row = run(f80, {1: 0.20})
+    row["duty"] = 60.0
+    check("只有 1× 时 1× 仍然过判据", row["rot_ok"])
+    check_eq("判定 = !blade", ps.classify(row), ps.VERDICT_BLADE_WEAK)
+
+    # --- E) 死掉的轴不能靠 SNR=inf 抢到"最佳轴"（老坑，R6.4.4 踩过）-------
+    s = sig(f80, {1: 0.20, 3: 0.05})
+    s[:, 0] = 0.0                            # ax 彻底死掉（全零）
+    pick = ps.pick_rot(cb.analyse(s, rate, rot_band=ps.DEFAULT_ROT_BAND))
+    check_eq("pick_rot 跳过全零轴，选中真正的振动轴", pick["axis"], "ay")
+    check("全零输入 → pick_rot 返回 None（不编出一个「假转速」）",
+          ps.pick_rot(cb.analyse(np.zeros((4000, 3)), rate,
+                                 rot_band=ps.DEFAULT_ROT_BAND)) is None)
+    check_eq("rot_hz 为空时判定 = !rot",
+             ps.classify({"rot_hz": None, "rot_ok": False}), ps.VERDICT_NO_ROT)
+
+    # --- F) 推荐逻辑：优先"两处都过"，再挑 1× 最接近目标的 ----------------
+    def row_of(duty, rot, ok=True, bw_hit=False):
+        """造一行"长得像 eval_capture 输出"的记录 —— 少了键会让渲染层炸掉，
+        所以字段要跟真实输出对齐（这也正是本次要测的东西）。"""
+        return {"duty": duty, "rot_hz": rot, "rot_ok": True, "rot_axis": "ay",
+                "rot_snr": 30.0, "rpm": 60.0 * rot,
+                "blade_hz": 3.0 * rot, "blade_snr": 18.0, "blade_ratio": 3.0,
+                "blade_band": (2.6 * rot, 3.4 * rot),
+                "blade_ok": ok, "blade_out_of_bw": bw_hit,
+                "blade_expected_hz": 3.0 * rot, "blade_over_bw_by": None}
+
+    best, truly = ps.recommend([row_of(40.0, 55.0, ok=False),
+                                row_of(60.0, 78.0),
+                                row_of(70.0, 95.0)], 80.0)
+    check_eq("推荐 = 可用档里 1× 最接近 80 Hz 的那一档", best["duty"], 60.0)
+    check("可用档要给 truly=True", truly is True)
+
+    best2, truly2 = ps.recommend([row_of(40.0, 50.0, ok=False),
+                                  row_of(60.0, 82.0, ok=False)], 80.0)
+    check_eq("一个可用档都没有 → 退一步选最接近的", best2["duty"], 60.0)
+    check("降级建议必须标明「不是真可用」，别把已知局限藏起来", truly2 is False)
+
+    check("连 1× 都没有 → 不给任何档位建议",
+          ps.recommend([{"duty": 30.0, "rot_hz": None, "rot_ok": False,
+                         "blade_ok": False, "blade_out_of_bw": False}], 80.0)
+          == (None, False))
+
+    # --- G) "占空比到底有没有生效"的判据 ----------------------------------
+    check("离散度：40/60/80 Hz → ≈66.7%",
+          abs(ps.rot_spread_pct([row_of(1, 40.0), row_of(2, 60.0),
+                                 row_of(3, 80.0)]) - 66.6667) < 0.01)
+    check("离散度 < 3% 会被报成「占空比没生效」（3.3 V 栅压下不可能这么稳）",
+          ps.rot_spread_pct([row_of(1, 79.0), row_of(2, 81.0)]) < 3.0)
+    check("只有一档时离散度无意义 → None",
+          ps.rot_spread_pct([row_of(1, 80.0)]) is None
+          or ps.rot_spread_pct([row_of(1, 80.0)]) is None)
+
+    # --- H) 输出层至少要能跑，不抛异常（表格与结论）-----------------------
+    # 🔴 顺带守住一个只在运行期才会炸的坑：argparse 会把 help 字符串**再做一次
+    #    % 格式化**，所以 help 里的字面量 % 必须写成 %%，否则连 --help 都打不开
+    #    （实测就是这个 `ValueError: unsupported format character`，测试跑不到它）。
+    try:
+        txt = ps.build_argparser().format_help()
+        check("--help 能渲染（help 里的字面量 % 必须写成 %%）",
+              "--ramp-step" in txt and len(txt) > 400, "len=%d" % len(txt))
+    except Exception as exc:                                  # noqa: BLE001
+        check("--help 能渲染（help 里的字面量 % 必须写成 %%）", False, repr(exc))
+
+    rows = [row_of(40.0, 55.0, ok=False), row_of(60.0, 78.0)]
+    try:
+        ps.print_header(3.0, 260.0, 80.0)
+        for rr in rows:
+            ps.print_row(rr)
+        ps.print_legend()
+        rc = ps.print_verdict(rows, 80.0, 3.0, 260.0, 34.6)
+        check("渲染整张表 + 结论不抛异常", True)
+        check_eq("有可用档时退出码 = 0", rc, 0)
+    except Exception as exc:                                  # noqa: BLE001
+        check("渲染整张表 + 结论不抛异常", False, repr(exc))
+
+
+def t_pwm_cmd():
+    """第 ⑦ 步命令验收工具（check_pwm_cmd.py 的解析层：不碰串口、不碰硬件）。
+
+    这一节守两件容易出错的事：
+    ① **子串 vs 独立数字** —— 判 `duty = 4%` 不能被 `duty = 40%` 的子串骗过（纪律 7）；
+    ② **两种回显的形态不同** —— `dNN` 只有一行短回显，`?` 才带括号说明，
+       解析器必须能分清，否则 `?` 的验收会永远 FAIL。
+    """
+    print("\n[16] PWM 命令验收（check_pwm_cmd.py 的解析层）")
+
+    banner = ("=== stm32-edge-ai-node boot ===\r\n"
+              "SYSCLK = 168000000 Hz, I2C1 = 400 kHz, TIM2 = 1 kHz\r\n"
+              "PWM: PA6/TIM3_CH1 @20000 Hz, duty=0% (USART1 cmd: dNN + Enter)\r\n")
+    check_eq("横幅 -> (20000, 0)", cpc.parse_banner(banner), (20000, 0))
+    check_eq("横幅 duty 非零也能读",
+             cpc.parse_banner("PWM: PA6/TIM3_CH1 @20000 Hz, duty=37%"), (20000, 37))
+    check_eq("改了 PSC 后频率跟着变",
+             cpc.parse_banner("PWM: PA6/TIM3_CH1 @1000 Hz, duty=0%"), (1000, 0))
+    check_eq("没有横幅行 -> (None, None)",
+             cpc.parse_banner("t=   100 | ax= 1 ay= 2 az= 3 | lost=0 ovf=0"), (None, None))
+    check_eq("空文本 -> (None, None)", cpc.parse_banner(""), (None, None))
+    check_eq("None -> (None, None)", cpc.parse_banner(None), (None, None))
+
+    # 真实回显：前面还夹着 10 Hz 数据行
+    echo = ("t=    100 | ax=  700 ay= -150 az= 16400 | lost=0 ovf=0\r\n"
+            "[PWM] duty = 40%\r\n"
+            "t=    200 | ax=  710 ay= -160 az= 16390 | lost=0 ovf=0\r\n")
+    check_eq("在数据行之间也能抓到回显", cpc.parse_echo(echo, 40), 40)
+    check_eq("🔴 duty=4 不能被 duty=40 的子串骗过", cpc.parse_echo(echo, 4), None)
+    check_eq("要求 0 而文本是 40 -> None", cpc.parse_echo(echo, 0), None)
+    check_eq("空文本 -> None", cpc.parse_echo("", 40), None)
+    check_eq("只有数据行 -> None", cpc.parse_echo("t= 100 | ax= 1\r\n", 40), None)
+
+    info = ("t=    300 | ax=  720 ay= -180 az= 16400 | lost=0 ovf=0\r\n"
+            "[PWM] duty = 40%  (PA6/TIM3_CH1 @20 kHz; cmd: dNN, NN = 0..100)\r\n")
+    duty_info, note = cpc.parse_info(info)
+    check_eq("信息行 duty", duty_info, 40)
+    check("信息行带上引脚与频率说明",
+          isinstance(note, str) and "PA6/TIM3_CH1" in note and "20 kHz" in note, repr(note))
+    check_eq("短回显不含括号 -> (None, None)", cpc.parse_info(echo), (None, None))
+    check_eq("信息行不认空文本", cpc.parse_info(""), (None, None))
+
+    # ---- LED 目视验收的步骤表（--led-test 用的纯函数） ----
+    plan1 = cpc.led_plan(1, 3.0)
+    check_eq("LED 一轮 = 3 步", len(plan1), 3)
+    check_eq("🔴 LED duty 序列 = 100/40/0（有对照才排除误判）",
+             [d for d, _, _ in plan1], [100, 40, 0])
+    check_eq("LED 每步说明各不相同", len({n for _, n, _ in plan1}), 3)
+    check_eq("LED hold 透传", {h for _, _, h in plan1}, {3.0})
+    check_eq("🔴 cycles=0 被夹到 1 轮（不会一步都不发）", len(cpc.led_plan(0, 2.0)), 3)
+    check_eq("cycles=2 -> 6 步，序列重复两遍",
+             [d for d, _, _ in cpc.led_plan(2, 1.5)], [100, 40, 0, 100, 40, 0])
+    check_eq("hold 透传到每一轮", {h for _, _, h in cpc.led_plan(3, 2.5)}, {2.5})
+
+    # --help 必须能渲染（守 argparse 会把 help 再做一次 % 格式化的坑）
+    try:
+        import io
+        import contextlib
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                cpc.main(["--help"])
+        except SystemExit:
+            pass
+        check("--help 能渲染", "PWM" in buf.getvalue(), buf.getvalue()[:60])
+        check("--help 含 --led-test", "--led-test" in buf.getvalue(), buf.getvalue()[:60])
+        check("--help 含 --cycles", "--cycles" in buf.getvalue(), buf.getvalue()[:60])
+        check("--help 含 --hold", "--hold" in buf.getvalue(), buf.getvalue()[:60])
+        check("--help 含 --set", "--set" in buf.getvalue(), buf.getvalue()[:60])
+    except Exception as exc:                                  # noqa: BLE001
+        check("--help 能渲染", False, repr(exc))
+
+    check_eq("--duty 越界被拒（退出码 2）", cpc.main(["--port", "COMx", "--duty", "110"]), 2)
+    check_eq("🔴 --set 越界被拒（退出码 2）", cpc.main(["--port", "COMx", "--set", "110"]), 2)
+    check_eq("--set 下界外也被拒", cpc.main(["--port", "COMx", "--led-test", "--set", "-3"]), 2)
+
+
 def main() -> int:
     print("=" * 68)
     print("stm32-edge-ai-node · PC 端数据链路自测（不需要硬件）")
@@ -589,10 +1062,15 @@ def main() -> int:
     t_stats_and_stack()
     t_windows()
     t_text_parsers()
+    t_text_rate_agreement()
+    t_binary_zero_frame_hint()
+    t_big_drop_positions()
     t_fake_physical_sanity()
     t_cli_smoke()
     t_rate_check()
     t_blade_peak()
+    t_pwm_sweep()
+    t_pwm_cmd()
 
     print("\n" + "=" * 68)
     print("结果：%d 通过 / %d 失败" % (_pass, _fail))

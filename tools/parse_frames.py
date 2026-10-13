@@ -70,8 +70,14 @@ def _tee_save_raw(chunks, path: str):
     print("[i] 原始字节已保存到 %s（%d 字节）" % (path, total))
 
 
-def collect_binary(args) -> tuple[list[np.ndarray], vf.ParserStats, float]:
-    """二进制帧路径：帧流 → (g 值块列表, 统计, 覆盖时长)。
+def collect_binary(args) -> tuple[list[np.ndarray], vf.ParserStats, float, bytes]:
+    """二进制帧路径：帧流 → (g 值块列表, 统计, 覆盖时长, 头部字节样本)。
+
+    🔴 为什么要带一段"头部字节样本"回去：**一帧都没解出时，固件的诊断信息
+       往往就在那几个字节里**。实测踩到过：mode 2 在传感器缺席时不出帧，而是
+       反复打印 `[WAIT] MPU6050 not found (id=0x00). Check wiring: ...`；
+       工具当时只报"重同步丢弃 870 字节"，于是排查被引向 TX/RX 接线 ——
+       而真正的原因，固件早就写在字节里了。
 
     🔴 串口采集时按 Ctrl-C 是**正常操作**（"采够了"），所以这里捕获它并
        优雅收尾 —— 否则刚采的几万个点会连同 CSV/图一起丢掉。
@@ -80,6 +86,8 @@ def collect_binary(args) -> tuple[list[np.ndarray], vf.ParserStats, float]:
     g_chunks: list[np.ndarray] = []
     n_frames = 0
     t_begin = time.time()
+    head = bytearray()
+    HEAD_KEEP = 512
 
     source = _make_source(args, binary=True)
     if args.save_raw:
@@ -88,6 +96,8 @@ def collect_binary(args) -> tuple[list[np.ndarray], vf.ParserStats, float]:
     interrupted = False
     try:
         for chunk in source:
+            if len(head) < HEAD_KEEP:
+                head += chunk[:HEAD_KEEP - len(head)]
             for f in parser.feed(chunk):
                 g_chunks.append(f.accel_g().astype(np.float32))
                 n_frames += 1
@@ -101,7 +111,36 @@ def collect_binary(args) -> tuple[list[np.ndarray], vf.ParserStats, float]:
     parser.finish()
     if interrupted:
         print("\n[i] 收到 Ctrl-C，停止采集（已收到的数据会照常写出）")
-    return g_chunks, parser.stats, time.time() - t_begin
+    return g_chunks, parser.stats, time.time() - t_begin, bytes(head)
+
+
+def _print_text_hint(head: bytes) -> None:
+    """收到字节但一帧都没解出时，把可读文本原样打出来 —— 固件的诊断就在里面。
+
+    注意这里**必须能判否**：真正的噪声（波特率不对、线悬空）不能被打成"固件输出"，
+    否则又是一条会把人带偏的假线索。
+
+    🔴 而且判据只能看**原始字节**，不能看解码后的字符串：
+       `decode(errors="replace")` 会把每个非法字节变成 U+FFFD，而 **U+FFFD 在 Python 里
+       `str.isprintable()` 是 True** —— 于是 `bytes(range(256))` 这种纯噪声也能刷出
+       88% 的"可打印占比"，被误判成固件输出。这个假阳性是被自测当场抓出来的。
+    """
+    if not head:
+        return
+    ok = sum(1 for b in head if 32 <= b < 127 or b in (9, 10, 13))
+    if ok < len(head) * 0.9:
+        return                      # 不像文本 → 更可能是噪声/波特率不对，别乱说
+    text = head.decode("utf-8", errors="replace")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return
+    print("  🔎 收到的字节看起来是**固件的文本输出**，不是帧流 —— 先读它：")
+    for ln in lines[:6]:
+        print("     | " + ln[:88])
+    if len(lines) > 6:
+        print("     | …（共 %d 行）" % len(lines))
+    print("     ⇒ 常见成因：传感器缺席/初始化失败 → 固件停在等待循环里不出帧；")
+    print("        或固件在 mode 0/1，而工具按二进制帧解（输出模式不匹配）。")
 
 
 def collect_text(args) -> tuple[list[np.ndarray], vs.TextParser, float]:
@@ -109,6 +148,7 @@ def collect_text(args) -> tuple[list[np.ndarray], vs.TextParser, float]:
     parser = vs.TextParser()
     g_chunks: list[np.ndarray] = []
     t_begin = time.time()
+    n_bytes = 0
 
     source = _make_source(args, binary=False)
     if args.save_raw:
@@ -117,6 +157,7 @@ def collect_text(args) -> tuple[list[np.ndarray], vs.TextParser, float]:
     interrupted = False
     try:
         for chunk in source:
+            n_bytes += len(chunk)
             text = chunk.decode("utf-8", errors="replace")
             rows = parser.feed(text)
             if rows:
@@ -126,12 +167,36 @@ def collect_text(args) -> tuple[list[np.ndarray], vs.TextParser, float]:
     except KeyboardInterrupt:
         interrupted = True
     parser.finish()
+    parser.bytes_in = n_bytes
     if parser.rows:
         # rows 已含全部历史，直接以它为准（避免重复拼接）
         g_chunks = [np.asarray(parser.rows, dtype=np.float32)]
     if interrupted:
         print("\n[i] 收到 Ctrl-C，停止采集（已收到的数据会照常写出）")
     return g_chunks, parser, time.time() - t_begin
+
+
+def reconcile_text_rate(rate_flag: float, text_raw_flag: bool,
+                        parser_mode: str | None) -> tuple[float, str | None]:
+    """把"CLI 开关推出来的采样率"和"解析器实际识别到的 mode"对齐。
+
+    🔴 为什么必须做这一步：`--text` 不给 `--text-raw` 时，速率会被当成
+       mode 1 的 200 Hz，而解析器那边**照样能认出** mode 0 的原始整数行。
+       于是报告里出现自相矛盾的一行（标签写 mode 0、数字写 200），
+       CSV 的 `t_s` 列也随之整体错 **20 倍** —— 而 `check_blade_peak.py`
+       的 `load_csv()` 正是**从 `t_s` 反推采样率**的，错会一路传下去。
+
+    返回 (最终速率, 警告文案或 None)。`parser_mode` 为 None（没认出任何格式）时原样返回。
+    """
+    if parser_mode is None:
+        return rate_flag, None
+    detected = RATE_TEXT_RAW if parser_mode == "raw" else RATE_TEXT_G
+    if detected == rate_flag:
+        return rate_flag, None
+    return detected, ("--text-raw %s，但实际解析到 mode %s → 采样率改用 %.0f Hz"
+                      "（原先按 %.0f Hz 计）"
+                      % ("已给" if text_raw_flag else "未给",
+                         parser_mode, detected, rate_flag))
 
 
 def _make_source(args, *, binary: bool):
@@ -271,12 +336,25 @@ def print_report_text(parser: vs.TextParser, rate: float, seconds: float) -> Non
         print("     想验「静置 ≈ +1 g」请停机采样，或改用 mode 1（200 Hz）。")
     elif len(s):
         print("     停机静置时这里应 ≈ 0.000 0.000 +1.000")
-    print("  实际接收耗时 %.2f 秒" % seconds)
+    print("  收到原始字节 %d | 实际接收耗时 %.2f 秒" % (parser.bytes_in, seconds))
+    if parser.bytes_in == 0:
+        # 🔴 必须和"解析口径不对"区分开：这两者排查方向完全相反。
+        #    实测教训（2026-10-12）：0 字节的真因就是 **CH340 的 TX/RX 接反**；
+        #    而当时报告只写"文本行 0"，看不出"一个字节都没到"，
+        #    于是被误判成解析口径问题，白绕了一圈。
+        print("  🔴 一个字节都没收到 —— 这**不是**解析问题，是链路问题。按这个顺序查：")
+        print("     ① CH340 的 TX/RX 是否**交叉**（TXD→PA10、RXD→PA9，最常犯）")
+        print("     ② GND 是否共地  ③ 端口号是否选对（--list-ports）")
+        print("     ④ 板子是否在跑（mode 0 下应有 10 Hz 打印 + LED 5 Hz 闪）")
+    elif len(s) == 0:
+        print("  🔴 收到 %d 字节但一行都没解出 —— 这才是**解析口径**问题："
+              % parser.bytes_in)
+        print("     固件 mode 与开关是否一致（mode 0 请用 --text --text-raw）。")
     print("-" * 68)
 
 
 def print_report_binary(stats: vf.ParserStats, samples: np.ndarray,
-                        rate: float, seconds: float) -> None:
+                        rate: float, seconds: float, head: bytes = b"") -> None:
     print("\n" + "-" * 68)
     print("二进制帧健康度")
     print("  " + stats.as_text())
@@ -286,6 +364,38 @@ def print_report_binary(stats: vf.ParserStats, samples: np.ndarray,
         print("  均值 [g]: ax=%.3f ay=%.3f az=%.3f   （静置时应 ≈ 0, 0, +1）"
               % (samples[:, 0].mean(), samples[:, 1].mean(), samples[:, 2].mean()))
     print("  实际接收耗时 %.2f 秒" % seconds)
+
+    if len(samples) and seconds >= 0.1:
+        # 🔴 `t_s` 是**按样本索引**算的（`arange(n)/rate`），不是壁钟。
+        #    固件一停（掉线重试 / 总线恢复 / 打诊断），这段壁钟就被压缩掉了 ——
+        #    而校验和与序号**全是绿的**（停掉的是时间，不是帧计数）。
+        #    这个差值是从外部唯一能察觉"接缝"的量，所以必须显式摊出来。
+        #    ⚠️ `--file` 离线重解析没有墙钟（seconds≈0），此时跳过 —— 否则会打出负数。
+        gap = seconds - len(samples) / rate
+        print("  壁钟缺口 %+.2f 秒 = 接收耗时 − 样本时长（在线正常值约 +0.05 秒）" % gap)
+        if gap > 0.30:
+            print("     ↑ 偏大 → 采集期间固件停过（掉线重试 / 总线恢复），时间轴有缺失")
+        elif gap < -0.10:
+            print("     ↑ 偏负 → 收到的字节比实时还多：适配器 FIFO 里的旧数据混进来了")
+
+    if stats.big_drops:
+        # 大段丢弃 = 固件在那一刻停了。只报**样本索引 > 0** 的：
+        # 索引 0 一般是采集开始前的启动横幅残留，不影响切窗。
+        frame_bytes = float(vf.frame_total(vf.DEFAULT_SAMPLES_PER_FRAME))
+        mid = [(i, n) for (i, n) in stats.big_drops if i > 0]
+        if mid:
+            print("  🔴 时间轴断点 %d 处 —— t_s 在这些位置不连续，**别当成连续序列切窗**:"
+                  % len(mid))
+            for i, n in mid[:5]:
+                print("       样本 %-8d 附近丢弃 %5d 字节 ≈ %.1f 帧 → 该处壁钟有缺失"
+                      % (i, n, n / frame_bytes))
+            if len(mid) > 5:
+                print("       …另有 %d 处" % (len(mid) - 5))
+
+    if not len(samples) and head:
+        # 🔴 一帧都没有但"收到过字节" —— 先别让用户去查接线：
+        #    固件自己的诊断（传感器缺席、启动横幅、复位原因）通常就在这些字节里。
+        _print_text_hint(head)
     bad = []
     if not len(samples):
         # 一个点都没有时打 ✅ 会误导人（"没问题"和"没收到"是两回事）
@@ -299,6 +409,14 @@ def print_report_binary(stats: vf.ParserStats, samples: np.ndarray,
     if stats.resync_bytes > 200:
         bad.append("重同步丢弃 %d 字节 → 前面混着文字属正常；若持续增长则是误同步"
                    % stats.resync_bytes)
+    if any(i > 0 for i, _ in stats.big_drops):
+        # 校验错 0 / 序号断档 0 并不等于"数据可以当连续序列用" ——
+        # 这两项查的是帧有没有丢，查不出"时间有没有停"。见上面的壁钟缺口。
+        bad.append("采集期间固件停过（见上面「时间轴断点」）→ 这批数据有接缝，"
+                   "切窗前必须跳过断点位置；要干净数据请重采")
+    if len(samples) and seconds >= 0.1 and (seconds - len(samples) / rate) > 0.30:
+        bad.append("壁钟缺口偏大 → 采集期间固件停过，t_s 已被压缩（接缝位置见上）；"
+                   "要干净数据请重采")
     if len(samples) and abs(float(samples[:, 2].mean()) - 1.0) > 0.25:
         bad.append("az 均值 %.3f 偏离 1 g 太多 → 芯片没贴平，或换算/LSB 档位写错"
                    % float(samples[:, 2].mean()))
@@ -389,23 +507,28 @@ def main(argv=None) -> int:
     if use_text:
         rate = args.rate or (RATE_TEXT_RAW if args.text_raw else RATE_TEXT_G)
         chunks, parser, wall = collect_text(args)
+        if args.rate is None:
+            # 以解析器**实际识别到的** mode 为准；显式给了 --rate 才不覆盖
+            rate, warn = reconcile_text_rate(rate, args.text_raw, parser.mode)
+            if warn:
+                print("[!] " + warn, file=sys.stderr)
         samples = (np.concatenate(chunks, axis=0) if chunks
                    else np.zeros((0, 3), dtype=np.float32))
         print_report_text(parser, rate, wall)
     else:
         rate = args.rate or RATE_BINARY
-        chunks, stats, wall = collect_binary(args)
+        chunks, stats, wall, head = collect_binary(args)
         samples = (np.concatenate(chunks, axis=0) if chunks
                    else np.zeros((0, 3), dtype=np.float32))
-        print_report_binary(stats, samples, rate, wall)
+        print_report_binary(stats, samples, rate, wall, head=head)
 
     if len(samples) == 0:
         print("\n[!] 一个点都没解出来。排查顺序：")
         print("    1) 接线：TX/RX 是否交叉、GND 是否共地")
         print("    2) 端口选对没：--list-ports")
         print("    3) 波特率是否 115200")
-        print("    4) 固件 APP_OUTPUT_MODE 与解析方式是否一致"
-              "（二进制要用默认，文本要加 --text）")
+        print("    4) 固件 APP_OUTPUT_MODE 与解析方式是否一致：")
+        print("       二进制帧 → 不加 --text；mode 1 → --text；mode 0 → --text --text-raw")
         return 2
 
     desc = ("串口 %s" % args.port if args.port

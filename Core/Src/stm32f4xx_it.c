@@ -59,6 +59,11 @@ extern TIM_HandleTypeDef htim2;
 extern UART_HandleTypeDef huart3;
 /* USER CODE BEGIN EV */
 
+/* 🔴 第 ⑦ 步手写补的一行：CubeMX 只为"在 .ioc 里使能了中断"的外设生成上面的
+ * extern（TIM2、USART3 有，USART1 没有）—— 而 USART1 的收中断正是本步新开的。
+ * 放在 USER CODE 区里，**重新 GENERATE CODE 也不会被删掉**。 */
+extern UART_HandleTypeDef huart1;
+
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -228,5 +233,21 @@ void USART3_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+
+/**
+  * @brief USART1 全局中断 —— 第 ⑦ 步引入：接收 PC 发来的 PWM 占空比命令。
+  *
+  * 🔴 这个处理函数**不是 CubeMX 生成的**：`.ioc` 里没有配置 USART1 的中断，
+  *    所以生成的 stm32f4xx_it.c 里没有它、NVIC 也没使能。
+  *    两者都由手写代码补上：
+  *      · 本体就在这里（放在 USER CODE 1 区，重新生成代码也不会丢）；
+  *      · NVIC 使能在 main.c 的 App_CmdRxStart()（抢占优先级 = 2）。
+  *    将来若在 CubeMX 里正式配置 USART1 中断，请把这两处统一成生成的版本，
+  *    否则会出现"两个 USART1_IRQHandler 重复定义"或优先级不一致。
+  */
+void USART1_IRQHandler(void)
+{
+  HAL_UART_IRQHandler(&huart1);
+}
 
 /* USER CODE END 1 */

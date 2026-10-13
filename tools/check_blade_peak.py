@@ -33,6 +33,13 @@
    而 Nyquist = 采样率/2 = **500 Hz**。峰 > 260 Hz 幅值已被带宽滚降压过
    （真实幅值更大）；峰 > 450 Hz 要怀疑是混叠镜像；**整条带都在 Nyquist 之外时
    看到的频率是假的**（不是"看不到"，是"位置是假的"）。
+4. 🔴 **搜索带取的是"带的**最大**幅值"，所以别的谐波会冒充叶频**。本项目叶频 =
+   `--blade-multiple`（默认 3）× 转频，而 `1×` 通常最强、`2×` 常与 `3×` 同量级 ⇒
+   只要叶频带下沿低于 `2 × 转频`，**`2×` 就会顶替 `3×` 被报成"叶频"并让门禁假通过**。
+   为此本工具会做**谐波自洽校验**：用实测 `1×` 反推期望叶频 `K × 转频`，再看带内
+   那个峰落在第几阶谐波上；若它其实是别的阶次（如 2×），**直接判不通过**并给出
+   该用的叶频带。⇒ **叶频带下沿应高于 `2 × 转频`**（3 V 档 410 Hz 之所以没事，
+   是因为默认带下沿 300 Hz 恰好把 273 Hz 的 2× 挡在外面 —— 降速后这个巧合就没了）。
 """
 
 from __future__ import annotations
@@ -53,6 +60,9 @@ DEFAULT_MIN_AMP_G = 0.002       # 2 mg：MPU6050 在 260 Hz 带内的噪声本�
 FLOOR_MIN_HZ = 5.0              # 本底统计与找峰都跳过 DC 附近
 NOTCH_HZ = 50.0                 # 算本底时挖掉峰两侧这么宽，免得峰把自己抬进本底
 DEVICE_BW_HZ = 260.0            # MPU6050 加速度带宽上限（R17）
+DEFAULT_BLADE_MULTIPLE = 3.0    # 叶频 = 该倍数 × 转频（本项目 3 叶）
+HARMONIC_TOL = 0.06             # 谐波阶次的相对容差（±6%）
+HARMONIC_ORDERS = (1, 2, 3, 4, 5)   # 参与比对的低次谐波阶次
 AXIS_NAMES = ("ax", "ay", "az")
 
 
@@ -233,6 +243,32 @@ def top_peaks(freqs, amp, n: int = 5, min_hz: float = FLOOR_MIN_HZ):
     return [(float(f[i]), float(a[i])) for i in cand[:n]]
 
 
+def nearest_harmonic(ratio: float, tol: float = HARMONIC_TOL,
+                     orders=HARMONIC_ORDERS):
+    """比值最接近哪个谐波阶次？落不进任何一阶就返回 None。
+
+    `tol` 是**相对**容差（0.06 = ±6%），因为 273 Hz 与 410 Hz 的绝对偏差
+    差着一个数量级，只有相对判据才同时管得住低阶与高阶。
+    """
+    if ratio is None or ratio <= 0.0:
+        return None
+    best = None
+    for n in orders:
+        if abs(ratio - n) <= n * float(tol):
+            if best is None or abs(ratio - n) < abs(ratio - best):
+                best = n
+    return best
+
+
+def blade_band_for(rot_hz: float, multiple: float = DEFAULT_BLADE_MULTIPLE,
+                   tol: float = 0.12):
+    """由实测 1× 反推该用的叶频搜索带（±12%），用于"带开错了"时给可执行建议。"""
+    if rot_hz is None or rot_hz <= 0.0:
+        return None
+    fc = float(multiple) * float(rot_hz)
+    return (fc * (1.0 - float(tol)), fc * (1.0 + float(tol)))
+
+
 def band_notes(band, rate: float):
     """搜索带本身的配置性警告（Nyquist 折叠 / 器件带宽）。"""
     lo, hi = float(band[0]), float(band[1])
@@ -276,12 +312,17 @@ def analyse(samples, rate: float, *, blade_band=DEFAULT_BLADE_BAND,
             rot_band=DEFAULT_ROT_BAND, nperseg: int = DEFAULT_NPERSEG,
             overlap: float = DEFAULT_OVERLAP, notch_hz: float = NOTCH_HZ,
             min_hz: float = FLOOR_MIN_HZ, min_snr: float = DEFAULT_MIN_SNR_DB,
-            min_amp: float = DEFAULT_MIN_AMP_G, floor_floor: float | None = None):
+            min_amp: float = DEFAULT_MIN_AMP_G, floor_floor: float | None = None,
+            blade_multiple: float = DEFAULT_BLADE_MULTIPLE,
+            harmonic_guard: bool = True):
     """三轴各算一次 → 结果字典。
 
     `floor_floor`（可选的**全局本底下限**）用于跨轴比较：真实系统里各轴本底
     应当同量级，若某轴本底异常低（纯数值噪声），会把那一轴的 SNR 抬得虚高。
     给了它就把各轴本底统一抬到该值，避免"最安静的轴"骗过判据。
+
+    🔴 `blade_multiple`（默认 3，本项目 3 叶）用于**谐波自洽校验**：叶频带取的
+    是带内最大幅值，`2×` 常常比 `3×` 还强 ⇒ 不校验就会把 `2×` 当叶频报"通过"。
     """
     samples = np.asarray(samples, dtype=np.float64)
     if samples.ndim != 2 or samples.shape[1] != 3:
@@ -292,6 +333,7 @@ def analyse(samples, rate: float, *, blade_band=DEFAULT_BLADE_BAND,
 
     segs = segment_count(n, nperseg, overlap)
     fold = fold_range(blade_band, rate)
+    want_order = int(round(float(blade_multiple)))
     freqs = None
     spectra = []
     axes = []
@@ -303,7 +345,10 @@ def analyse(samples, rate: float, *, blade_band=DEFAULT_BLADE_BAND,
             freqs = f
         spectra.append(a)
 
-        row = {"axis": AXIS_NAMES[k], "index": k}
+        row = {"axis": AXIS_NAMES[k], "index": k,
+               "ratio": None, "harmonic": None, "blade_harmonic": False,
+               "blade_inconsistent": False, "blade_expected_hz": None,
+               "blade_thresh_ok": False}
         for tag, band in (("blade", blade_band), ("rot", rot_band)):
             pk = peak_in_band(f, a, band, min_hz=min_hz)
             if pk is None:
@@ -323,6 +368,21 @@ def analyse(samples, rate: float, *, blade_band=DEFAULT_BLADE_BAND,
             row[tag + "_snr"] = snr_db(p_amp, fl)
             row[tag + "_ok"] = bool(row[tag + "_snr"] >= min_snr
                                     and p_amp >= min_amp)
+
+        # 🔴 谐波自洽：带内那个"叶频峰"到底是第几阶谐波？
+        # 只要转频带里有峰（哪怕它其实是噪声频点），比值对不上 K 就**否决**：
+        # 宁可判"不通过"让人去查搜索带，也不能拿别的谐波冒充叶频放行。
+        row["blade_thresh_ok"] = row["blade_ok"]
+        if row["blade_hz"] and row["rot_hz"]:
+            row["blade_expected_hz"] = float(blade_multiple) * row["rot_hz"]
+            row["ratio"] = row["blade_hz"] / row["rot_hz"]
+            row["harmonic"] = nearest_harmonic(row["ratio"])
+            if harmonic_guard and row["harmonic"] != want_order:
+                row["blade_ok"] = False
+                if row["harmonic"] is not None:
+                    row["blade_harmonic"] = True
+                else:
+                    row["blade_inconsistent"] = True
         row["notes"] = peak_notes(row["blade_hz"] or 0.0, rate)
         row["blade_alias"] = bool(
             fold and row["blade_hz"] is not None
@@ -334,6 +394,13 @@ def analyse(samples, rate: float, *, blade_band=DEFAULT_BLADE_BAND,
                                          r["blade_snr"] or -1e9), reverse=True)
     blade_ok = any(r["blade_ok"] for r in axes)
     rot_ok = any(r["rot_ok"] for r in axes)
+    # 用"过了转频判据的最强轴"的 1× 反推建议叶频带（谐波校验失败时给可执行建议）
+    # 用"确实测到了 1× 且过了判据"的轴的 1× 反推建议叶频带。
+    # 🔴 必须带 rot_ok 这一条：全零/死掉的轴频谱恒为 0 → 本底 0 → SNR = inf，
+    #    会把"最安静"的轴排到第一，反推出一个凭空的建议带（实测踩过）。
+    rot_rows = sorted([r for r in axes if r["rot_hz"] and r["rot_ok"]],
+                      key=lambda r: r["rot_snr"] or -1e9, reverse=True)
+    suggest = blade_band_for(rot_rows[0]["rot_hz"], blade_multiple) if rot_rows else None
 
     return {
         "rate": rate, "n": n, "segs": segs, "freqs": freqs, "spectra": spectra,
@@ -343,6 +410,11 @@ def analyse(samples, rate: float, *, blade_band=DEFAULT_BLADE_BAND,
         "min_snr": min_snr, "min_amp": min_amp,
         "nperseg": int(nperseg), "overlap": float(overlap),
         "null_db": null_bound_db(segs), "fold": fold,
+        "blade_multiple": float(blade_multiple),
+        "harmonic_guard": bool(harmonic_guard),
+        "blade_suggest_band": suggest,
+        "any_ratio_veto": any(r["blade_harmonic"] or r["blade_inconsistent"]
+                              for r in axes),
         "top": top_peaks(freqs, spectra[ranked[0]["index"]] if ranked else spectra[0],
                          n=5, min_hz=min_hz),
         "notes": band_notes(blade_band, rate) + band_notes(rot_band, rate),
@@ -484,6 +556,33 @@ def print_report(r: dict, src: str, rate_src: str) -> None:
         extra = "  ← 上/下调 1/3 即叶频" if tag == "转频带" else ""
         print("  %d) %7.1f Hz  %.5f g   [%s]%s" % (i, hz, amp, tag, extra))
 
+    # 🔴 谐波自洽：带内那个峰到底是不是"K × 转频"？不是的话上面的判定不算数。
+    print("\n谐波自洽（叶频应 = %.2f × 转频）" % r["blade_multiple"])
+    for row in r["axes"]:
+        if not row["rot_hz"]:
+            print("  %-4s 转频带无峰 → 校验不了" % row["axis"])
+        elif not row["blade_hz"]:
+            print("  %-4s 1× = %6.1f Hz → 期望叶频 %6.1f Hz，但叶频带内没有峰"
+                  % (row["axis"], row["rot_hz"], row["blade_expected_hz"] or 0.0))
+        else:
+            want = int(round(float(r["blade_multiple"])))
+            if row["harmonic"] == want:
+                mark, what = "✅", "与 %.0f× 一致" % r["blade_multiple"]
+            elif row["blade_harmonic"]:
+                mark, what = "❌", "其实是 %d× 转频谐波，**不是叶频**" % row["harmonic"]
+            else:
+                mark, what = "❌", ("与 %.0f× 不符、也不是低次谐波 → 多半是环境峰"
+                                    % r["blade_multiple"])
+            print("  %-4s 1× = %6.1f Hz → 期望叶频 %6.1f Hz ｜ 带内峰 %6.1f Hz，"
+                  "比值 %.2f %s %s"
+                  % (row["axis"], row["rot_hz"], row["blade_expected_hz"] or 0.0,
+                     row["blade_hz"], row["ratio"] or 0.0, mark, what))
+            if mark == "❌":
+                print("        → 这个峰 **不算通过**（与 1× 不自洽，别拿它当叶频）")
+    if r["blade_suggest_band"]:
+        print("  建议叶频带（由 1× 反推，±12%%）： %.0f %.0f Hz"
+              % r["blade_suggest_band"])
+
     if r["blade_ok"]:
         best = [x for x in r["axes"] if x["blade_ok"]]
         top = max(best, key=lambda x: x["blade_snr"])
@@ -507,7 +606,32 @@ def verdict(r: dict) -> int:
             print("       要拿到真实叶频：PWM 限速把叶频压到 Nyquist 以下再测一次。")
         return 0
     print(">>> 结论：❌ 不通过 —— 叶频带没有明显高于本底的峰")
-    if r["rot_ok"]:
+    if r.get("any_ratio_veto"):
+        bad = [x for x in r["axes"] if x["blade_harmonic"] or x["blade_inconsistent"]]
+        b = max(bad, key=lambda x: x["blade_snr"] or -1e9)
+        if b["blade_harmonic"]:
+            print("    🔴 更要紧的是：叶频带里那个最强的峰 %.1f Hz 是 **%d× 转频谐波**，"
+                  % (b["blade_hz"], b["harmonic"]))
+        else:
+            print("    🔴 更要紧的是：叶频带里那个最强的峰 %.1f Hz **与 1× 不自洽**"
+                  "（比值 %.2f，既不是 %.0f×、也不是低次谐波），"
+                  % (b["blade_hz"], b["ratio"] or 0.0, r["blade_multiple"]))
+            print("       它多半是别的谐波或者环境峰 —— 别把它当成叶频。")
+        print("       （1× = %.1f Hz，是在 --rot-band %.0f–%.0f 里量到的）"
+              % (b["rot_hz"], r["rot_band"][0], r["rot_band"][1]))
+        top = r["top"][0] if r["top"] else None
+        if top and not (r["rot_band"][0] <= top[0] <= r["rot_band"][1]):
+            print("       ⚠️ 全谱最强峰是 %.1f Hz（%.5f g），**不在转频带内** —— "
+                  "它很可能才是真正的 1×。" % top)
+            print("          → 把 --rot-band 改成覆盖它再跑一次。")
+        if r["blade_suggest_band"]:
+            print("       → 按实测 1× 反推，叶频应在 %.0f Hz 附近 → "
+                  "改成 --blade-band %.0f %.0f 重跑。"
+                  % (r["blade_multiple"] * (b["rot_hz"] or 0.0),
+                     r["blade_suggest_band"]))
+        print("       ⚠️ 叶频带下沿必须高于 2× 转频（%.0f Hz），否则 2× 总会顶替叶频。"
+              % (2.0 * (b["rot_hz"] or 0.0)))
+    elif r["rot_ok"]:
         best = [x for x in r["axes"] if x["rot_ok"]]
         top = max(best, key=lambda x: x["rot_snr"])
         print("    但 %s 轴的 1× 转频可见（%.1f Hz，SNR %.1f dB）"
@@ -547,10 +671,19 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="峰幅值绝对下限 g，默认 0.002")
     p.add_argument("--blade-band", type=float, nargs=2,
                    default=list(DEFAULT_BLADE_BAND), metavar=("LO", "HI"),
-                   help="叶频搜索带 Hz，默认 %g %g" % DEFAULT_BLADE_BAND)
+                   help="叶频搜索带 Hz，默认 %g %g（🔴 下沿应高于 2× 转频）"
+                        % DEFAULT_BLADE_BAND)
     p.add_argument("--rot-band", type=float, nargs=2,
                    default=list(DEFAULT_ROT_BAND), metavar=("LO", "HI"),
                    help="转频搜索带 Hz，默认 %g %g" % DEFAULT_ROT_BAND)
+    p.add_argument("--blade-multiple", type=float,
+                   default=DEFAULT_BLADE_MULTIPLE, metavar="K",
+                   help="叶频 = K × 转频，默认 %g（3 叶桨）；用于谐波自洽校验"
+                        % DEFAULT_BLADE_MULTIPLE)
+    p.add_argument("--no-harmonic-guard", dest="harmonic_guard",
+                   action="store_false",
+                   help="关掉谐波自洽否决权（只在「1× 确实在器件上看不到、"
+                        "但叶频确实存在」时用；默认开着）")
     p.add_argument("--plot", metavar="PATH", nargs="?", const="blade_peak.png",
                    help="画三轴频谱图（默认存 blade_peak.png）")
     p.add_argument("--show", action="store_true", help="弹窗显示图")
@@ -578,7 +711,9 @@ def main(argv=None) -> int:
     try:
         r = analyse(samples, rate, blade_band=tuple(args.blade_band),
                     rot_band=tuple(args.rot_band), nperseg=args.nperseg,
-                    min_snr=args.min_snr, min_amp=args.min_amp)
+                    min_snr=args.min_snr, min_amp=args.min_amp,
+                    blade_multiple=args.blade_multiple,
+                    harmonic_guard=args.harmonic_guard)
     except Exception as e:                                    # noqa: BLE001
         print("[ERROR] 算不了：%s" % e)
         return 2

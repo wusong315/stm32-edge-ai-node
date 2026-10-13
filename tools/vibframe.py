@@ -111,6 +111,11 @@ class Frame:
         return np.stack([self.ax, self.ay, self.az], axis=1) / ACCEL_LSB_PER_G
 
 
+# 一次丢弃 >= 这么多字节，就认为"流里混进了一整块非帧数据"（开机横幅、固件文本诊断…），
+# 值得把**位置**记下来。200 B 略大于一帧（198 B），所以单帧被切坏不会误报。
+BIG_DROP_BYTES = 200
+
+
 @dataclass
 class ParserStats:
     """健康度计数 —— 上板后**先看这几个数**，比看波形更能说明问题。"""
@@ -121,6 +126,15 @@ class ParserStats:
     seq_gaps: int = 0           # 序号跳变的次数
     frames_lost: int = 0        # 由序号跳变推算出的丢帧总数
     truncated: int = 0          # 流结束时残留在缓冲里的字节数
+
+    # 🔴 大段丢弃的**位置**：`[(样本索引, 丢弃字节数), ...]`，只记 >= BIG_DROP_BYTES 的。
+    #    为什么非要记位置：`t_s` 是**按样本索引**算的（`arange(n)/rate`），
+    #    所以固件一旦停机（掉线 → 重试 → 恢复），这段**壁钟时间会被悄悄压缩掉**；
+    #    而序号仍然连续（停掉的是时间，不是帧计数），于是
+    #    **校验错 0 / 序号断档 0 —— 全绿，时间轴却是断的**。
+    #    这种"看不见的接缝"一旦混进训练集，就是把两段不相干的振动拼成一个样本。
+    #    位置记下来，切窗前才能跳过它。
+    big_drops: list = field(default_factory=list)
 
     def as_text(self) -> str:
         return ("帧 %d / 采样点 %d | 校验错 %d | 重同步丢弃 %d 字节 | "
@@ -155,6 +169,17 @@ class FrameParser:
         self._last_seq: int | None = None
         self._primed = False      # 是否已经成功解出过至少一帧
 
+    def _note_drop(self, nbytes: int) -> None:
+        """丢弃 nbytes 个字节时记账，大段丢弃额外记下**发生时已解出的样本数**。
+
+        小段丢弃（找同步头时丢几个字节）是链路常态，位置没有意义；
+        大段丢弃才有意义 —— 它说明**固件刚才停了**（掉线重试 / 总线恢复 /
+        或者在打启动横幅）。串口层面这是正常的，时间轴层面不是：
+        `t_s` 按样本索引算，这段壁钟被压缩掉了，所以断点位置必须留下。"""
+        self.stats.resync_bytes += nbytes
+        if nbytes >= BIG_DROP_BYTES:
+            self.stats.big_drops.append((self.stats.samples_ok, nbytes))
+
     # -- 内部：尝试从缓冲头部解出一帧 ------------------------------------
     def _try_one(self) -> Frame | None:
         """解出缓冲头部的一帧。
@@ -177,11 +202,11 @@ class FrameParser:
                     keep = 1 if (len(buf) and buf[-1] == FRAME_HDR0) else 0
                     drop = len(buf) - keep
                     if drop > 0:
-                        self.stats.resync_bytes += drop
+                        self._note_drop(drop)
                         del buf[:drop]
                     return None
                 if idx > 0:
-                    self.stats.resync_bytes += idx
+                    self._note_drop(idx)
                     del buf[:idx]
 
             # 2) 头 5 字节齐了才能知道点数

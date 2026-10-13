@@ -59,6 +59,10 @@ void TIM2_IRQHandler(void);
 void USART3_IRQHandler(void);
 /* USER CODE BEGIN EFP */
 
+/* 第 ⑦ 步手写补的中断服务函数（理由见 stm32f4xx_it.c 里的注释）：
+ * .ioc 未配置 USART1 中断，所以 CubeMX 不会声明也不会生成它。 */
+void USART1_IRQHandler(void);
+
 /* USER CODE END EFP */
 
 #ifdef __cplusplus
