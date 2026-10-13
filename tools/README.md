@@ -31,8 +31,9 @@ D:\STM32Projects\pc-venv\Scripts\python.exe
 | `check_blade_peak.py` | **频谱门禁**：判断叶频/转频峰真的压过本底没有（R6.4 第 ⑥ 步 / R17） |
 | `pwm_sweep.py` | **PWM 扫频**：扫占空比找转速工作点（转频 ≈80 Hz / 叶频 ≈240 Hz，R6.4 第 ⑦ 步） |
 | `check_pwm_cmd.py` | **PWM 命令通路验收**：不需要电机/电池的第 ⑦ 步验收（横幅 → `dNN` 回显 → `?` 信息行 → 归零）；`--led-test` 是第 ③ 步的 LED 目视验收；`--set NN` 停在某档不归零，配合万用表量电压 |
-| `calib_dev.py` | **六姿态静态标定**：把零偏 `b` 与增益 `k` **分开**（单姿态解不出来），产出 `calib.json` + C 头文件片段，并带**独立验证**（T3）；`--identify` 可先告诉你"手上这个面是哪个姿态" |
-| `selftest.py` | **自测**：285 条断言，不需要硬件 |
+| `calib_dev.py` | **六姿态静态标定**：把零偏 `b` 与增益 `k` **分开**（单姿态解不出来），产出 `calib.json` + C 头文件片段，并带**独立验证**（T3）；`--watch` 可实时看三轴、`--identify` 可先告诉你"手上这个面是哪个姿态" |
+| `watch.cmd` | **双击即可**的启动器 → `calib_dev.py --watch`（串口自动挑；`.cmd` 内**故意只用 ASCII**，中文输出全由 Python 负责） |
+| `selftest.py` | **自测**：300 条断言，不需要硬件 |
 
 ## 先跑自测（每次改完代码都该跑）
 
@@ -41,7 +42,7 @@ cd D:\STM32Projects\stm32-edge-ai-node\tools
 D:\STM32Projects\pc-venv\Scripts\python.exe selftest.py
 ```
 
-全绿输出 `结果：285 通过 / 0 失败` 且退出码为 0。退出码非 0 说明协议层被动过。
+全绿输出 `结果：300 通过 / 0 失败` 且退出码为 0。退出码非 0 说明协议层被动过。
 
 ## 用法
 
@@ -351,16 +352,36 @@ R₋ = k·(−16384) + b     （该轴朝下）
 三个轴各来一遍，共 6 个姿态。**这是本项目唯一不依赖 DRV8833 的硬件活** ——
 只要 MPU6050 已上板（R6.4 ①②）就能做。
 
-#### 🔴 第 0 步：先让工具告诉你「手上这个面是哪个姿态」
+#### 🔴 第 0 步：先「自己看」——实时三轴 + 姿态识别
 
 姿态名（`+x` / `-z` …）是**相对芯片自己的坐标系**说的，而板子上只有一行丝印 ——
-**照着文字猜方向，正是整个流程里最容易出错的一步**。所以别猜：
+**照着文字猜方向，正是整个流程里最容易出错的一步**。所以别猜，先让它实时报：
 
 ```
-D:\STM32Projects\pc-venv\Scripts\python.exe calib_dev.py --port COM5 --identify
+cd D:\STM32Projects\stm32-edge-ai-node\tools
+
+# A. 实时看：翻动板子，看最后一列「推断」怎么变（Ctrl-C 停止）
+D:\STM32Projects\pc-venv\Scripts\python.exe calib_dev.py --watch
+
+# B. 只问一次「我现在拿的是哪个面」
+D:\STM32Projects\pc-venv\Scripts\python.exe calib_dev.py --identify
 ```
 
-随便摆一个面（任意面都行、不需要你先知道它是哪个）、松手静止，它会报：
+`--watch` 每 1 s 刷一行（`--interval` 可调）：
+
+```
+   t=   3.5s  n= 10   ax=     +33  ay=    -213  az=  +16597   |a|=1.0131  σ=0.0030   +z  OK
+```
+
+倒数第二列 `OK` / `!!` / `??` 分别是「判据全过」/「摆歪或在动（后面跟短标签，
+如 `侧轴残留`）」/「认不出」。
+
+🔴 **两个模式都不给 `--port` 也能跑** —— 它会自动按描述优先匹配 CH340 / CP210
+这类 USB 转串口芯片，**并且一定打印它用了哪一个**（"选错端口"与"接线故障"现象
+一模一样，不把选择摆到明面上，排查就会走错方向）。多个候选分不清时它会**报错并
+列出全部**，让你显式 `--port`，**不猜**。
+
+随便摆一个面（任意面都行、不需要你先知道它是哪个）、松手静止，`--identify` 会报：
 
 ```
   均值 LSB  ax=+33  ay=-213  az=+16597   |a| = 1.0131 g   最大轴内 σ = 0.0030 g
@@ -434,6 +455,59 @@ D:\STM32Projects\pc-venv\Scripts\python.exe calib_dev.py --solve --json calib.js
   「6 姿态 k/b」预留 24 B）。接口就绪前，标定结果用于**离线修正数据集**同样有效。
 
 **退出码**：`0` 判据通过 / `1` 采集到了但判据不过 / `2` 环境或数据问题。
+
+### 11) 自己在电脑上跑（三种方式，从省事到手动）
+
+**方式 1 · 双击（最省事，不需要会命令行）**
+
+打开资源管理器到
+
+```
+D:\STM32Projects\stm32-edge-ai-node\tools
+```
+
+双击 **`watch.cmd`** → 立刻开始实时看三轴（串口自动挑）。
+
+> ⚠️ 这个 `.cmd` **内部故意只用 ASCII**（中文 Windows 控制台是 GBK，`.cmd` 里的中文
+> 容易乱码）；所有中文提示都由 Python 打印，不受影响。
+> ⚠️ 按 Ctrl-C 停止后，若出现 `Terminate batch job (Y/N)?` —— 按 **N**（不是 Y），
+> 否则窗口会直接关掉、看不到刚才的数据。
+
+**方式 2 · 自己开一个终端**（想看别的模式时用）
+
+1. 在资源管理器的地址栏里输入 `cmd` 回车（就在当前文件夹打开命令行）；
+   或在这个文件夹里**右键 → 在终端中打开**（Win11）。
+2. 粘贴命令：
+
+```
+D:\STM32Projects\pc-venv\Scripts\python.exe calib_dev.py --watch
+D:\STM32Projects\pc-venv\Scripts\python.exe calib_dev.py --identify
+D:\STM32Projects\pc-venv\Scripts\python.exe calib_dev.py --guided
+```
+
+（把 `--watch` 换成别的模式即可；`--list-ports` 看有哪些串口。）
+
+**方式 3 · 不装 Python 也能看：串口终端**
+
+板子在 `APP_OUTPUT_MODE=0/1` 时串口上就是**人可读的文本行**，任何串口终端（你机器上
+已有 **MobaXterm**）都能直接看：
+
+```
+COM4  115200  8N1       # 直接看原始数据行
+```
+
+看到的是固件自己打印的 `t=… ax=… ay=… az=… lost=… ovf=…`。
+🔴 **一个串口同一时刻只能被一端打开** —— MobaXterm 占着时，Python 工具会报
+"could not open port"；反过来也一样。用完记得断开。
+
+**常见现象对照**
+
+| 现象 | 含义 |
+|---|---|
+| `[ERROR] 没有找到任何串口` | 板子没插 / CH340 驱动没装 / 数据线是纯充电线 |
+| `could not open port …` | 串口被别的程序占着（MobaXterm / CubeProgrammer 的串口监视器） |
+| 一行数据都没有、`无法解析` 也在涨 | 波特率不对，或 `APP_OUTPUT_MODE` 与解析方式不匹配 |
+| `t=…` 一直在刷但 ax/ay/az 全是 0 | mode 2/3 二进制档下不会有文本 —— 切回 mode 0/1 |
 
 ## 命令行参数
 

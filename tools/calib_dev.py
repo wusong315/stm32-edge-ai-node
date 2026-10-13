@@ -15,8 +15,11 @@
 
 跑法::
 
-    # 🔴 先问它「我现在拿的是哪个面」—— 不用自己对着丝印猜
-    python calib_dev.py --port COM5 --identify
+    # 🔴 先"自己看"：实时刷新三轴 + 推断姿态（翻板子看它怎么变）
+    python calib_dev.py --watch
+
+    # 🔴 再问它「我现在拿的是哪个面」—— 不用自己对着丝印猜
+    python calib_dev.py --identify
 
     # 单姿态（一次摆一个，可分批做）
     python calib_dev.py --port COM5 --pose +z
@@ -240,6 +243,76 @@ def usable_poses(doc: dict) -> list[str]:
         if rec and not rec.get("problems"):
             out.append(p)
     return out
+
+
+# 自动选串口时优先匹配的芯片/描述关键字（不区分大小写）。
+PORT_PREFER = ("CH340", "CH341", "CH343", "CP210", "USB-SERIAL", "USB SERIAL",
+               "SILICON LABS", "FT232", "PROLIFIC")
+
+
+def device_of(line: str) -> str:
+    """从 `list_serial_ports()` 的一行里取出设备名（如 `COM4`）。"""
+    parts = line.split()
+    return parts[0] if parts else ""
+
+
+def pick_port(lines: list[str], prefer: tuple[str, ...] = PORT_PREFER):
+    """自动挑一个串口，返回 ``(port 或 None, 说明)``。
+
+    为什么要这一层：本机可能同时插着 **ST-Link 的虚拟串口**与 **CH340**，而
+    **选错端口**的现象（收不到数据）与**接线故障**一模一样 —— 会把排查引向错误方向。
+    所以宁可多一层"按描述优先"的筛选，并且**必须把最终用了哪一个打印出来**。
+
+    规则（**宁可报错，也不猜**）：
+      * 0 个 → `(None, …)`；1 个 → 直接用它；
+      * 多个、但只有 1 个命中 `prefer` → 用它；
+      * 其余（多个命中 / 一个都不命中）→ `(None, 列出全部)`，让用户显式 `--port`。
+    """
+    if not lines:
+        return None, ("没有找到任何串口 —— 板子插好了吗？CH340 驱动装了吗？"
+                      "（可用 `--list-ports` 看）")
+    if len(lines) == 1:
+        return device_of(lines[0]), "只有一个串口，直接用它"
+    hits = [ln for ln in lines if any(k.lower() in ln.lower() for k in prefer)]
+    if len(hits) == 1:
+        return device_of(hits[0]), "按描述唯一匹配到一个 USB 转串口芯片"
+    return None, ("有 %d 个串口，无法自动确定 —— 请显式指定 `--port`：\n    %s"
+                  % (len(lines), "\n    ".join(lines)))
+
+
+def short_problem(p: str) -> str:
+    """把 `diagnose_pose` 的长句子压成一个短标签（给实时刷新那行用）。"""
+    for key, tag in (("符号反了", "符号反"), ("主分量落在", "轴不对"),
+                     ("偏离 1 g", "幅值偏"), ("残留", "侧轴残留"),
+                     ("板子在动", "在动"), ("读数为 0", "轴为 0")):
+        if key in p:
+            return tag
+    return "?"
+
+
+def watch_line(rows, t_s: float, *, static_tol: float = DEFAULT_STATIC_TOL,
+               off_tol: float = DEFAULT_OFF_TOL,
+               mag_tol: float = DEFAULT_MAG_TOL) -> str:
+    """把一小段样本压成**一行**实时显示（含合矢量、轴内 σ 与推断出的姿态）。
+
+    纯函数：`--watch` 的刷新行全靠它，所以自测能覆盖。
+    """
+    arr = np.asarray(rows, dtype=np.float64)
+    mean, sigma = mean_sigma(arr)
+    pose, problems, info = identify_pose(mean, sigma, static_tol=static_tol,
+                                         off_tol=off_tol, mag_tol=mag_tol)
+    flag = "OK" if (pose and not problems) else ("??" if pose is None else "!!")
+    reason = ""
+    if pose is None and arr.shape[0]:
+        reason = "认不出（没落在任何一个面上）"
+    elif problems:
+        reason = "；".join(short_problem(p) for p in problems)
+    smax = float(np.max(sigma)) if arr.shape[0] else 0.0
+    return ("  t=%6.1fs  n=%3d   ax=%+8.0f  ay=%+8.0f  az=%+8.0f"
+            "   |a|=%.4f  σ=%.4f   %-3s %s%s"
+            % (t_s, int(arr.shape[0]), info["raw_lsb"][0], info["raw_lsb"][1],
+               info["raw_lsb"][2], info["mag_g"], smax,
+               pose or "--", flag, ("   " + reason) if reason else ""))
 
 
 def solve(pose_means: dict[str, np.ndarray]) -> dict:
@@ -629,6 +702,68 @@ def run_identify(args, doc: dict) -> int:
     return 0
 
 
+def run_watch(args) -> int:
+    """实时看三轴读数与推断姿态（**只为"看清方向"，不是采集**）。
+
+    设计取舍：**只开一次串口**。`vibsource.serial_source` 每调用一次就开/关一次
+    串口，而反复开关串口既慢又可能让器件复位 —— 所以这里用一个长连接
+    （`duration=None`），把 `TextParser.feed()` 的返回值按时间窗切段统计。
+    这样既不丢行（parser 的 `_tail` 一直保留），内存也不随时间增长。
+    """
+    print("=" * 68)
+    print("实时看三轴　port=%s @%d　每 %.1f s 刷新一行"
+          % (args.port, args.baud, args.interval))
+    print("=" * 68)
+    print("让它一直跑，**翻动板子**看最后一列「推断」怎么变。Ctrl-C 停止。")
+    print("mode 0（原始整数，10 Hz）与 mode 1（g 值，200 Hz）都认。")
+    print("🔴 这一档只是让你**先看清方向**；采标定数据仍要走 `--guided`（要求松手静止）。")
+    print("-" * 68)
+    print("   %s   %s      %s        %s        %s   %s  %s   %s"
+          % ("时间", "样本", "ax(LSB)", "ay(LSB)", "az(LSB)", "合矢量", "轴内σ", "推断"))
+
+    tp = vs.TextParser()
+    t0 = time.time()
+    win_start = t0
+    buf: list = []
+    total = 0
+    rows_shown = 0
+    try:
+        for chunk in vs.serial_source(args.port, args.baud, duration=None,
+                                      idle_timeout=args.idle_timeout,
+                                      verbose=not args.quiet):
+            tp.bytes_in += len(chunk)
+            buf.extend(tp.feed(chunk.decode("ascii", "replace")))
+            now = time.time()
+            if now - win_start >= args.interval:
+                if buf:
+                    total += len(buf)
+                    print(watch_line(buf, now - t0, static_tol=args.static_tol,
+                                     off_tol=args.off_tol, mag_tol=args.mag_tol))
+                    rows_shown += 1
+                    buf = []
+                else:
+                    print("  t=%6.1fs   —— 这段时间内没有解出任何数据行"
+                          "（累计收到 %d 字节，文本模式 %r）" % (now - t0,
+                                                              tp.bytes_in, tp.mode))
+                win_start = now
+    except KeyboardInterrupt:
+        print("\n[Ctrl-C] 已停止。")
+    except Exception as e:                                     # noqa: BLE001
+        print("\n[ERROR] %s" % e)
+        print("        排查：① 串口是否被别的程序（MobaXterm）占着 —— 一个串口同时只能被一端打开")
+        print("              ② 板子是否在跑 APP_OUTPUT_MODE=0/1（只有这两档输出文本）")
+        return 2
+
+    print("-" * 68)
+    print("共显示 %d 行、解出 %d 个样本；累计收到 %d 字节（%s）"
+          % (rows_shown, total, tp.bytes_in, tp.as_text()))
+    if total == 0:
+        print("🔴 一个样本都没解出来 —— 先怀疑**观察链路**（端口 / 模式 / 波特率），"
+              "再怀疑传感器（本项目踩坑 3）。")
+        return 1
+    return 0
+
+
 def run_verify(args, doc: dict) -> int:
     """独立验证：任意姿态新采一段，比较标定前后的 |a| 偏差。"""
     solved = doc.get("solved")
@@ -730,7 +865,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="退出码：0 通过 / 1 判据不过 / 2 环境或数据问题")
     ap.add_argument("--list-ports", action="store_true", help="列出串口后退出")
-    ap.add_argument("--port", help="串口设备（Windows 如 COM5）")
+    ap.add_argument("--port", help="串口设备（不给则自动挑一个；多个候选时会让你显式指定）")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--pose", choices=POSE_NAMES,
                     help="采单个姿态（可分批做，结果累积在 --json 里）")
@@ -740,6 +875,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--solve", action="store_true", help="解算（不碰硬件，读 --json）")
     ap.add_argument("--verify", action="store_true",
                     help="独立验证：任意姿态采集，比较标定前后 |a| 偏差")
+    ap.add_argument("--watch", action="store_true",
+                    help="实时看三轴读数与推断姿态（只为看清方向，不是采集）")
+    ap.add_argument("--interval", type=float, default=1.0,
+                    help="--watch 每行覆盖的秒数，默认 1.0（10 Hz 下约 10 个样本）")
+    ap.add_argument("--idle-timeout", type=float, default=5.0,
+                    help="--watch 静默多少秒后自动退出，默认 5")
     ap.add_argument("--emit-c", metavar="FILE", help="导出 C 头文件片段（配合 --solve）")
     ap.add_argument("--json", default="calib.json", help="标定数据文件，默认 calib.json")
     ap.add_argument("--seconds", type=float, default=DEFAULT_SECONDS,
@@ -760,6 +901,26 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def resolve_port(args) -> tuple[str | None, int]:
+    """确定用哪个串口：给了 `--port` 就用它，否则按描述自动挑一个。
+
+    自动挑**一定会打印用了哪一个** —— "选错端口"与"接线故障"现象相同，
+    不把选择结果摆到明面上，排查就会走错方向。
+    """
+    if args.port:
+        return args.port, 0
+    lines = vs.list_serial_ports()
+    port, why = pick_port(lines)
+    if port is None:
+        print("[ERROR] %s" % why)
+        return None, 2
+    matched = [ln for ln in lines if device_of(ln) == port]
+    print("[i] 自动选择串口：**%s**（%s）%s"
+          % (port, why, ("\n    命中：" + matched[0]) if matched else ""))
+    print("    （要指定别的，加 `--port COMx`；想先看清单，跑 `--list-ports`）")
+    return port, 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -777,11 +938,14 @@ def main(argv: list[str] | None = None) -> int:
         print("[ERROR] --emit-c 需要配合 --solve")
         return 2
 
-    if not args.port:
-        print("[ERROR] 需要 --port（或 --list-ports / --solve / --identify）")
-        print("        例：python calib_dev.py --port COM5 --identify")
-        print("        例：python calib_dev.py --port COM5 --guided")
-        return 2
+    # ↓ 以下全部要用串口 —— 统一在这里解析一次
+    port, rc = resolve_port(args)
+    if port is None:
+        return rc
+    args.port = port
+
+    if args.watch:
+        return run_watch(args)
 
     if args.identify:
         doc = load_doc(args.json)      # 只读：用来看"六姿态还差几个"

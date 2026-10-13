@@ -1207,6 +1207,38 @@ def t_calib():
              cd.usable_poses(dp), ["+x", "+y"])
     check_eq("usable_poses：空文件 → 空列表", cd.usable_poses({}), [])
 
+    # ---- pick_port：自动选串口（宁可报错也不猜）----
+    p, _ = cd.pick_port([])
+    check_eq("pick_port：0 个串口 → None", p, None)
+    p, _ = cd.pick_port(["COM4  [USB-SERIAL CH340 | 1A86:7523]"])
+    check_eq("pick_port：只有 1 个 → 直接用它", p, "COM4")
+    p, _ = cd.pick_port(["COM4  [USB-SERIAL CH340 | 1A86:7523]",
+                         "COM7  [STMicroelectronics STLink Virtual COM Port]"])
+    check_eq("pick_port：多口中唯一命中 CH340 → 选它", p, "COM4")
+    p, why = cd.pick_port(["COM4  [USB-SERIAL CH340 | 1A86:7523]",
+                           "COM5  [USB-SERIAL CH341 | 1A86:5523]"])
+    check("pick_port：多个都像 USB 串口 → 不猜，返回 None 并列出全部",
+          p is None and "COM4" in why and "COM5" in why, why)
+    check_eq("device_of：从清单行取设备名", cd.device_of("COM12  [CH340]"), "COM12")
+
+    # ---- short_problem / watch_line：实时刷新那一行 ----
+    check_eq("short_problem：符号反", cd.short_problem("**符号反了**：az 轴实测 -1.0 g"), "符号反")
+    check_eq("short_problem：侧轴残留", cd.short_problem("侧轴 ax 残留 +0.2000 g 超过 0.080 g"), "侧轴残留")
+    check_eq("short_problem：在动", cd.short_problem("**采集期间板子在动**：az 轴标准差 0.05 g"), "在动")
+
+    line = cd.watch_line([[0.0, 0.0, 1.0]] * 10, 3.5)
+    check("watch_line：干净 +z 那一行带 OK 与 +z",
+          "OK" in line and "+z" in line and "t=   3.5s" in line, line)
+    line = cd.watch_line([[0.2, 0.0, 0.98]] * 10, 1.0)
+    check("watch_line：摆歪时给出 !! 与短标签（不是长句子）",
+          "!!" in line and "侧轴残留" in line, line)
+    line = cd.watch_line([[0.4, 0.41, 0.45]] * 10, 2.0)
+    check("watch_line：认不出时给 ?? 并说明原因",
+          "??" in line and "认不出" in line, line)
+    line = cd.watch_line([[0.0, 0.0, 1.0]] * 10, 1.0)
+    check("watch_line：合矢量按 16384 口径显示",
+          "|a|=1.0000" in line and "az=  +16384" in line, line)
+
     # ---- solve 的两条拒绝路径 ----
     try:
         cd.solve({k: v for k, v in ideal.items() if k != "+z"})
@@ -1268,8 +1300,16 @@ def t_calib():
 
     # ---- CLI 冒烟 ----
     check_eq("CLI：--emit-c 缺 --solve → 退出码 2", cd.main(["--emit-c", "x.h"]), 2)
-    check("--help 含 --identify", "--identify" in cd.build_parser().format_help())
-    check_eq("CLI：--identify 缺 --port → 退出码 2", cd.main(["--identify"]), 2)
+    helps = cd.build_parser().format_help()
+    check("--help 含 --identify", "--identify" in helps)
+    check("--help 含 --watch", "--watch" in helps)
+    check("--help 含 --interval", "--interval" in helps)
+    # 串口打不开时必须"快速退 2"而不是卡住或抛栈
+    check_eq("CLI：--identify 打不开串口 → 退 2",
+             cd.main(["--port", "COMx", "--identify", "--yes", "--countdown", "0",
+                      "--quiet"]), 2)
+    check_eq("CLI：--watch 打不开串口 → 退 2",
+             cd.main(["--port", "COMx", "--watch", "--quiet"]), 2)
     smoke = os.path.join(tempfile.gettempdir(), "calib_smoke_%d.json" % os.getpid())
     if os.path.exists(smoke):
         os.remove(smoke)
