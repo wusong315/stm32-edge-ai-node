@@ -33,7 +33,7 @@ D:\STM32Projects\pc-venv\Scripts\python.exe
 | `check_pwm_cmd.py` | **PWM 命令通路验收**：不需要电机/电池的第 ⑦ 步验收（横幅 → `dNN` 回显 → `?` 信息行 → 归零）；`--led-test` 是第 ③ 步的 LED 目视验收；`--set NN` 停在某档不归零，配合万用表量电压 |
 | `calib_dev.py` | **六姿态静态标定**：把零偏 `b` 与增益 `k` **分开**（单姿态解不出来），产出 `calib.json` + C 头文件片段，并带**独立验证**（T3）；`--watch` 可实时看三轴、`--identify` 可先告诉你"手上这个面是哪个姿态" |
 | `watch.cmd` | **双击即可**的启动器 → `calib_dev.py --watch`（串口自动挑；`.cmd` 内**故意只用 ASCII**，中文输出全由 Python 负责） |
-| `selftest.py` | **自测**：305 条断言，不需要硬件 |
+| `selftest.py` | **自测**：312 条断言，不需要硬件 |
 
 ## 先跑自测（每次改完代码都该跑）
 
@@ -42,7 +42,7 @@ cd D:\STM32Projects\stm32-edge-ai-node\tools
 D:\STM32Projects\pc-venv\Scripts\python.exe selftest.py
 ```
 
-全绿输出 `结果：305 通过 / 0 失败` 且退出码为 0。退出码非 0 说明协议层被动过。
+全绿输出 `结果：312 通过 / 0 失败` 且退出码为 0。退出码非 0 说明协议层被动过。
 
 ## 用法
 
