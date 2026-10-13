@@ -419,6 +419,48 @@ def capture(port: str, baud: int, seconds: float, *, quiet: bool = False):
     return mean, sigma, int(s.shape[0]), tp.mode, nbytes
 
 
+def explain_serial_error(e: BaseException, port: str | None = None) -> str:
+    """把串口异常翻译成「照着做就行」的中文提示（返回多行文本）。
+
+    为什么值得单列一个函数：``PermissionError(13, '拒绝访问。')`` 是本工具**最高频**
+    的失败（一个串口同一时刻只能被一端打开），而它的原始字样完全看不出该干什么 ——
+    照抄原文 = 让人自己去搜。实测 2026-10-13 一个晚上撞了两次（都是双击开的
+    ``watch.cmd`` 没关）。
+
+    🔴 判据顺序有讲究：pyserial 把底层异常包成 ``SerialException``，消息形如
+    ``could not open port 'COM5': PermissionError(13, '拒绝访问。', None, 5)``
+    —— 它**同时**含「打不开」与「拒绝访问」两种特征，所以**占用必须排在不存在之前**，
+    否则会被后一条抢走。
+    """
+    msg = str(e)
+    low = msg.lower()
+    where = port or "串口"
+
+    if (isinstance(e, PermissionError) or "permissionerror" in low
+            or "拒绝访问" in msg or "access is denied" in low):
+        return (
+            "[ERROR] 打不开 %s：**已被别的程序占用**"
+            "（一个串口同一时刻只能被一端打开）。\n"
+            "        常见占用者（按概率）：\n"
+            "          ① 另一个双击开的 `watch.cmd` 黑窗口 —— 关掉它\n"
+            "             （窗口标题形如 `MPU6050 - live view ...`）\n"
+            "          ② MobaXterm / 串口助手里已打开的串口会话\n"
+            "          ③ 上一个没退干净的采集进程（Ctrl-C 后残留）\n"
+            "        处理：关掉上面任一个后重跑；或 `--port COMx` 换一个口。\n"
+            "        ⚠️ `--list-ports` **只枚举、不打开**，口被占着它照样列得出来 ——\n"
+            "           列得出来 ≠ 能用。" % where)
+
+    if (isinstance(e, FileNotFoundError) or "filenotfound" in low
+            or "could not open port" in low or "no such" in low):
+        return (
+            "[ERROR] 打不开 %s：**口不存在或已被拔掉**。\n"
+            "        处理：① 确认 CH340 的 USB 插好（板上 D1 亮）\n"
+            "              ② 跑 `--list-ports` 看它现在叫什么 —— 换 USB 口会换号"
+            "（COM6/COM7…）。" % where)
+
+    return "[ERROR] 打不开 %s：%s" % (where, msg)
+
+
 def pause_before_capture(note: str, *, auto: bool, countdown: float,
                          quiet: bool) -> None:
     """打印提示，然后（回车 或 倒数）放行。`wait_for_user` 的通用版。"""
@@ -454,7 +496,9 @@ def capture_pose(args, pose: str, doc: dict) -> tuple[bool, str]:
         mean, sigma, n, tmode, nbytes = capture(args.port, args.baud, args.seconds,
                                                 quiet=args.quiet)
     except Exception as e:                                     # noqa: BLE001
-        return False, "采集失败：%s" % e
+        print()
+        print(explain_serial_error(e, args.port))
+        return False, "%s 采集失败（打不开 %s）" % (pose, args.port)
 
     if n < args.min_samples:
         return False, ("只解出 %d 个样本（收到 %d 字节，文本模式 %r），少于 %d —— "
@@ -651,7 +695,7 @@ def run_identify(args, doc: dict) -> int:
         mean, sigma, n, tmode, nbytes = capture(args.port, args.baud, args.seconds,
                                                 quiet=args.quiet)
     except Exception as e:                                     # noqa: BLE001
-        print("[ERROR] 采集失败：%s" % e)
+        print(explain_serial_error(e, args.port))
         return 2
     if n < args.min_samples:
         print("[ERROR] 只解出 %d 个样本（%d 字节）—— 见 --pose 的排查清单。" % (n, nbytes))
@@ -749,9 +793,8 @@ def run_watch(args) -> int:
     except KeyboardInterrupt:
         print("\n[Ctrl-C] 已停止。")
     except Exception as e:                                     # noqa: BLE001
-        print("\n[ERROR] %s" % e)
-        print("        排查：① 串口是否被别的程序（MobaXterm）占着 —— 一个串口同时只能被一端打开")
-        print("              ② 板子是否在跑 APP_OUTPUT_MODE=0/1（只有这两档输出文本）")
+        print("\n" + explain_serial_error(e, args.port))
+        print("        另外核对：板子在跑 `APP_OUTPUT_MODE=0/1` 吗？（只有这两档输出文本）")
         return 2
 
     print("-" * 68)
@@ -781,7 +824,7 @@ def run_verify(args, doc: dict) -> int:
         mean, sigma, n, tmode, nbytes = capture(args.port, args.baud, args.seconds,
                                                 quiet=args.quiet)
     except Exception as e:                                     # noqa: BLE001
-        print("[ERROR] 采集失败：%s" % e)
+        print("\n" + explain_serial_error(e, args.port))
         return 2
 
     if n < args.min_samples:

@@ -1221,6 +1221,25 @@ def t_calib():
           p is None and "COM4" in why and "COM5" in why, why)
     check_eq("device_of：从清单行取设备名", cd.device_of("COM12  [CH340]"), "COM12")
 
+    # ---- explain_serial_error：把串口异常翻成「照着做」的提示 ----
+    # 实测教训（2026-10-13）：PermissionError 是最高频失败，原文照抄等于让人去搜。
+    perm = cd.explain_serial_error(PermissionError(13, "拒绝访问。"), "COM5")
+    check("explain_serial_error：PermissionError → 点出「被占用」并教怎么查",
+          "占用" in perm and "watch.cmd" in perm and "只能被一端打开" in perm, perm)
+    check("explain_serial_error：提醒「--list-ports 列得出来 ≠ 能用」",
+          "只枚举" in perm, perm)
+    wrapped = "could not open port 'COM5': PermissionError(13, '拒绝访问。', None, 5)"
+    check("explain_serial_error：pyserial 包裹后的消息（含 could not open port）仍判为占用",
+          "占用" in cd.explain_serial_error(OSError(wrapped), "COM5"), wrapped)
+    miss = cd.explain_serial_error(
+        OSError("could not open port 'COM9': FileNotFoundError(2, "
+                "'系统找不到指定的文件。', None, 2)"), "COM9")
+    check("explain_serial_error：不存在 → 提示插好 USB 与 --list-ports",
+          "不存在" in miss and "--list-ports" in miss, miss)
+    other = cd.explain_serial_error(ValueError("怪事"), "COM5")
+    check("explain_serial_error：认不出的异常 → 仍带口名与原消息",
+          "COM5" in other and "怪事" in other, other)
+
     # ---- short_problem / watch_line：实时刷新那一行 ----
     check_eq("short_problem：符号反", cd.short_problem("**符号反了**：az 轴实测 -1.0 g"), "符号反")
     check_eq("short_problem：侧轴残留", cd.short_problem("侧轴 ax 残留 +0.2000 g 超过 0.080 g"), "侧轴残留")

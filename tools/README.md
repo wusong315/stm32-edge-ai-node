@@ -33,7 +33,7 @@ D:\STM32Projects\pc-venv\Scripts\python.exe
 | `check_pwm_cmd.py` | **PWM 命令通路验收**：不需要电机/电池的第 ⑦ 步验收（横幅 → `dNN` 回显 → `?` 信息行 → 归零）；`--led-test` 是第 ③ 步的 LED 目视验收；`--set NN` 停在某档不归零，配合万用表量电压 |
 | `calib_dev.py` | **六姿态静态标定**：把零偏 `b` 与增益 `k` **分开**（单姿态解不出来），产出 `calib.json` + C 头文件片段，并带**独立验证**（T3）；`--watch` 可实时看三轴、`--identify` 可先告诉你"手上这个面是哪个姿态" |
 | `watch.cmd` | **双击即可**的启动器 → `calib_dev.py --watch`（串口自动挑；`.cmd` 内**故意只用 ASCII**，中文输出全由 Python 负责） |
-| `selftest.py` | **自测**：300 条断言，不需要硬件 |
+| `selftest.py` | **自测**：305 条断言，不需要硬件 |
 
 ## 先跑自测（每次改完代码都该跑）
 
@@ -42,7 +42,7 @@ cd D:\STM32Projects\stm32-edge-ai-node\tools
 D:\STM32Projects\pc-venv\Scripts\python.exe selftest.py
 ```
 
-全绿输出 `结果：300 通过 / 0 失败` 且退出码为 0。退出码非 0 说明协议层被动过。
+全绿输出 `结果：305 通过 / 0 失败` 且退出码为 0。退出码非 0 说明协议层被动过。
 
 ## 用法
 
@@ -500,12 +500,18 @@ COM4  115200  8N1       # 直接看原始数据行
 🔴 **一个串口同一时刻只能被一端打开** —— MobaXterm 占着时，Python 工具会报
 "could not open port"；反过来也一样。用完记得断开。
 
+🔴 **双击 `watch.cmd` 之前，先关掉上一次那个窗口。** 这是实测里**最高频**的翻车
+（2026-10-13 一晚上撞两次）：第二次双击时第一个窗口还开着、占着串口 → 之后所有
+`--identify` / `--guided` / `--verify` 全部报 `PermissionError(13, '拒绝访问。')`。
+那个窗口的标题形如 `MPU6050 - live view ...`，找不到就按标题搜任务栏。
+
 **常见现象对照**
 
-| 现象 | 含义 |
+| 现象 | 含义 / 怎么办 |
 |---|---|
 | `[ERROR] 没有找到任何串口` | 板子没插 / CH340 驱动没装 / 数据线是纯充电线 |
-| `could not open port …` | 串口被别的程序占着（MobaXterm / CubeProgrammer 的串口监视器） |
+| `打不开 COM5：已被别的程序占用` | **一个串口只能被一端打开**。按提示里的 ①②③ 找：另一个 `watch.cmd` 黑窗口 / MobaXterm 的串口会话 / 没退干净的旧采集进程。⚠️ `--list-ports` **只枚举、不打开**，口被占着它照样列得出来 |
+| `打不开 COM5：口不存在或已被拔掉` | 换 USB 口会换号（COM6/COM7…）→ `--list-ports` 看它现在叫什么 |
 | 一行数据都没有、`无法解析` 也在涨 | 波特率不对，或 `APP_OUTPUT_MODE` 与解析方式不匹配 |
 | `t=…` 一直在刷但 ax/ay/az 全是 0 | mode 2/3 二进制档下不会有文本 —— 切回 mode 0/1 |
 
