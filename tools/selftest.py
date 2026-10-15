@@ -1255,6 +1255,22 @@ def t_calib():
           bool(getattr(sys.stdout, "write_through", False)),
           str(getattr(sys.stdout, "write_through", None)))
 
+    # ---- _normalize_argv：负号开头的姿态名必须能传进去 ----
+    # 实测踩坑（2026-10-15 真机采 -z）：argparse 把 `-z` 当选项 ⇒
+    # `--pose -z` 报 "expected one argument"，六个面里三个传不进去。
+    check_eq("_normalize_argv：`--pose -z` 改写成 `--pose=-z`",
+             cd._normalize_argv(["--pose", "-z"]), ["--pose=-z"])
+    check_eq("_normalize_argv：`--pose -y` 同样（三个负号面都要能传）",
+             cd._normalize_argv(["--pose", "-y", "--yes"]), ["--pose=-y", "--yes"])
+    check_eq("_normalize_argv：其它参数原样放行",
+             cd._normalize_argv(["--seconds", "6", "--pose", "+x"]),
+             ["--seconds", "6", "--pose=+x"])
+    check_eq("_normalize_argv：值不合法时不动（让 argparse 正常报错）",
+             cd._normalize_argv(["--pose", "foo"]), ["--pose", "foo"])
+    check_eq("CLI：`--pose -z` 现在能被 argparse 解析出 `-z`",
+             cd.build_parser().parse_args(
+                 cd._normalize_argv(["--pose", "-z"])).pose, "-z")
+
     # ---- short_problem / watch_line：实时刷新那一行 ----
     check_eq("short_problem：符号反", cd.short_problem("**符号反了**：az 轴实测 -1.0 g"), "符号反")
     check_eq("short_problem：侧轴残留", cd.short_problem("侧轴 ax 残留 +0.2000 g 超过 0.080 g"), "侧轴残留")

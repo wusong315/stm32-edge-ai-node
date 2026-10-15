@@ -986,9 +986,32 @@ def _unbuffer_stdout() -> None:
         pass
 
 
+def _normalize_argv(argv: list[str]) -> list[str]:
+    """把 `["--pose", "-z"]` 改写成 `["--pose=-z"]`。
+
+    🔴 **必须做**：argparse 遇到以 `-` 开头的值会把它当成**选项** ⇒ `--pose -z` 直接
+    报 ``error: argument --pose: expected one argument``；而六个面里有**三个是负号
+    开头的**（`-x` / `-y` / `-z`）⇒ 它们**根本传不进去**。2026-10-15 真机第一次采
+    `-z` 时撞到（`--pose=-z` 本来能用，但没人想得到要这么写）。
+
+    刻意只改这一种形态、不做通用解析 —— 通用化会把"用户其实写错了"也悄悄吞掉。
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--pose" and i + 1 < len(argv) and argv[i + 1] in POSE_NAMES:
+            out.append("--pose=" + argv[i + 1])
+            i += 2
+            continue
+        out.append(argv[i])
+        i += 1
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     _unbuffer_stdout()
-    args = build_parser().parse_args(argv)
+    raw = list(sys.argv[1:]) if argv is None else list(argv)
+    args = build_parser().parse_args(_normalize_argv(raw))
 
     if args.list_ports:
         for line in vs.list_serial_ports():
