@@ -107,6 +107,48 @@ _Static_assert(BL_SLOT_A_VECT_TAB_OFF == (BL_SLOT_A_ADDR - BL_FLASH_BASE),
 _Static_assert(BL_SLOT_B_VECT_TAB_OFF == (BL_SLOT_B_ADDR - BL_FLASH_BASE),
                "Slot B 的 VECT_TAB_OFFSET 与槽地址不一致");
 
+/* =====================================================================
+ * 六、扇区号（S3 新增）
+ * =====================================================================
+ * ⚠️ 上面第三节只保证了"起点落在扇区边界"，但 HAL_FLASHEx_Erase 要的是
+ *    **扇区号**，不是地址。扇区号由地址反推（F4 扇区不等大，见 bl_flash.c 的
+ *    BL_FlashSectorOf），这里把"应该推出来的值"写死一份，两边对照 ——
+ *    这样"地址算错"和"扇区表记错"会互相咬住，不会一起错过去。
+ *
+ * 🔴 为什么需要这个对照：擦除粒度是扇区。若把参数区的扇区号写成 3，
+ *    第一次自愈就会把 **App A 的头 16 KB 擦掉** —— 而且擦完还"看起来正常"
+ *    （元数据写成功、打印一切正常），直到 S5 烧完 App 才发作。 */
+#define BL_BOOT_SECTOR          (0UL)       /* 0x08000000 */
+#define BL_META_SECTOR          (2UL)       /* 0x08008000 */
+#define BL_SLOT_A_SECTOR        (3UL)       /* 0x0800C000 */
+#define BL_SLOT_B_SECTOR        (7UL)       /* 0x08060000 */
+#define BL_LOG_SECTOR           (10UL)      /* 0x080C0000 */
+
+/* =====================================================================
+ * 七、参数区记录格式（S3 新增）
+ * =====================================================================
+ * 🔴 为什么参数区是「记录日志」而不是"两个固定副本"（这是一个实测出来的更正）：
+ *    文档里原话是"双副本交替写"。但**擦除粒度是整个扇区**，而参数区 16 KB
+ *    = 恰好一个扇区（S2）⇒ "擦掉旧副本、写新副本"这个动作**做不到**
+ *    （擦一个副本必然把另一个也擦掉，中间出现"零份有效"的窗口）。
+ *
+ *    正确实现 = **顺序追加日志**：新记录写在扇区内第一个空白（0xFFFFFFFF）位置，
+ *    **不需要擦除**；读的时候扫全扇区，取 seq 最大且 CRC 正确的那条。
+ *    - 掉电在写记录的中途 → 该条 CRC 不过 → 自动回退到上一条 ⇒ 掉电安全；
+ *    - 记录写满整个扇区才擦一次（128 次写才擦 1 次）⇒ 擦除窗口被摊薄 128 倍。
+ *    语义上仍然是"多副本 + 交替写"，且任意时刻至少有一份有效。 */
+#define BL_META_REC_SIZE        (128UL)     /* 每条记录 128 B */
+#define BL_META_REC_COUNT       (BL_META_SIZE / BL_META_REC_SIZE)  /* = 128 条 */
+#define BL_META_CRC_OFF         (BL_META_REC_SIZE - 4UL)           /* crc32 落在末字 */
+#define BL_META_CRC_SPAN        (BL_META_CRC_OFF)                  /* CRC 覆盖整条记录 */
+
+_Static_assert(BL_META_SIZE % BL_META_REC_SIZE == 0UL,
+               "参数区大小不能被记录大小整除（最后一条记录会跨界）");
+_Static_assert((BL_META_REC_SIZE % 4UL) == 0UL,
+               "记录大小必须是 4 的整数倍（Flash 按字编程）");
+_Static_assert(BL_META_REC_COUNT >= 8UL,
+               "参数区记录的条数太少，擦除次数会变得频繁");
+
 #ifdef __cplusplus
 }
 #endif
