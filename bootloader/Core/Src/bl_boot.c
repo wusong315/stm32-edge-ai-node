@@ -3,7 +3,7 @@
   * @file    bl_boot.c
   * @brief   Bootloader 主流程。
   *
- * @note    🔴 施工阶段（推演稿 §7）：**本文件当前到 S6 的范围**。
+ * @note    🔴 施工阶段（推演稿 §7）：**本文件当前到 S7 的范围**。
  *
  *          S3 = "读元数据 → 校验镜像 → 合法才跳 / 不合法就留在原地"。
  *          ✅ S5 已真机闭环（把 Slot A 版 App 烧到 `0x0800C000`，跳过去运行正常）。
@@ -45,7 +45,7 @@ extern UART_HandleTypeDef huart1;
  * 🔴 以后排查"到底烧进去的是哪一版"时，这一行是唯一可信的锚：
  *    别靠文件时间戳，那玩意儿在复制/解压时会变。 */
 #define BL_VERSION_MAJOR    (0U)
-#define BL_VERSION_MINOR    (4U)    /* S3：元数据 + 校验 + 跳转；S5：真机闭环；S6：串口升级 */
+#define BL_VERSION_MINOR    (5U)    /* S3 元数据+校验+跳转；S5 真机闭环；S6 串口升级；S7 坏包拒收（修"窗口后沿用陈旧判断"的跳转缺陷） */
 
 /* =====================================================================
  * 槽表 —— 一处定义，后面只按 id 取
@@ -73,7 +73,7 @@ static void BL_WaitUpdateWindow(void);
 static void BL_PrintBanner(void)
 {
   printf("\r\n\r\n");
-  printf("=== stm32-ota-bootloader v%u.%u (S6: serial OTA -> slot B) ===\r\n",
+  printf("=== stm32-ota-bootloader v%u.%u (S7: serial OTA + bad-frame reject) ===\r\n",
          (unsigned)BL_VERSION_MAJOR, (unsigned)BL_VERSION_MINOR);
   /* 构建时间戳同样有用：OTA 只会替换 App，Bootloader 是长期不动的，
    * 这一行能立刻回答"现在板上跑的是哪次编的 Bootloader"。 */
@@ -401,6 +401,35 @@ static void BL_BootDecision(int haveMeta, const BL_Meta_t *m, int justInstalled)
       {
         windowDone = 1;
         BL_WaitUpdateWindow();
+
+        /* ============================================================
+         * 🔴 S7 修正：窗口里可能**跑过一整套 OTA**。必须在这里重新判一次。
+         * ============================================================
+         * 升级成功不会走到这行（`BL_OtaRun()` 返回 1 后内部就 `NVIC_SystemReset()`
+         * 了）；但**升级失败**（坏帧重传用尽 / 擦除失败 / 镜像 CRC32 不符 /
+         * 主机中途断线）会正常返回 —— 而那时目标槽**已经先被擦掉**（擦除发生在
+         * 收数据之前），甚至可能只写了一半。
+         *
+         * 不改的话后果是：`st` / `sp` / `rv` 是**窗口之前**读的旧值，
+         * 下面那句 `JUMP` 会照样执行 ⇒ 明明刚打印了
+         * "image REJECTED ... -> stay in bootloader"，下一行却跳进那个坏槽
+         * （2026-10-16 实测踩到：Slot B 被擦成空白后仍按旧的 MSP/入口跳，
+         *  极端情况就是拿 `MSP=0xFFFFFFFF` 进 App ⇒ 必 HardFault）。
+         *
+         * 修正：**重新读一次**，不合法就 `continue` 去试另一个槽；
+         * 两个都不行自然落到下面那句 "neither slot is bootable" ⇒ 进安全等待。
+         *
+         * ⚠️ 残留（留给 `S8`）：`BL_ImageCheck()` 只看**头 8 字节**（初始 MSP +
+         *    Reset 向量），所以"擦了一半、但向量表完好"的槽**仍会被判成合法**。
+         *    要根治必须让启动决策能校验**整镜像**（把声明的 CRC32 记进元数据、
+         *    启动时读回重算），那是 `S8` 回滚判据的一部分。 */
+        st = BL_ReportSlot(id, &sp, &rv);
+        if (st != BL_IMG_OK)
+        {
+          printf("[BL] %s became INVALID during the update window -> NOT jumping\r\n",
+                 BL_Slots[id].name);
+          continue;
+        }
       }
 
       if (pass == 1U)

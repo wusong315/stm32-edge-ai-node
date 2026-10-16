@@ -538,7 +538,7 @@ COM4  115200  8N1       # 直接看原始数据行
 | 一行数据都没有、`无法解析` 也在涨 | 波特率不对，或 `APP_OUTPUT_MODE` 与解析方式不匹配 |
 | `t=…` 一直在刷但 ax/ay/az 全是 0 | mode 2/3 二进制档下不会有文本 —— 切回 mode 0/1 |
 
-### 12) 串口升级（OTA · `S6`）：把新固件灌进 Slot B
+### 12) 串口升级（OTA · `S6`）与坏包拒收（`S7`）
 
 **这是 `ota_send.py` 的活**，与上面 1)–11) 那套"采数据"工具是两回事：上面都在 App 里跑，
 这个是**让 Bootloader 从 PC 收一份新固件**。
@@ -568,18 +568,55 @@ D:\STM32Projects\pc-venv\Scripts\python.exe tools\ota_send.py \
 **跑完会自动判 6 条**（不靠肉眼看）：读完回 CRC32 与声明值一致 / 已置 `update_pending=1` /
 复位后走到提交步骤 / `active_slot` 切到 B / 真的跳到 Slot B / App 横幅出现。**全过才退出码 0。**
 
+#### 12.1 坏包拒收（`S7`）：`--corrupt N`
+
+```bash
+# 让**设备**先放弃（--retries 12 > 设备侧 BL_OTA_MAX_RETRY=8），才证得到它自己的重传预算
+D:\STM32Projects\pc-venv\Scripts\python.exe tools\ota_send.py \
+  --bin "D:\STM32Projects\_tmp\app_slotB.bin" --port COM5 --corrupt 0 --retries 12 --stlink-reset
+```
+
+**预期（实测 2026-10-16，5/5 判据全过、退出码 0）**：
+
+```
+[OTA] frame 0 crc16 FAIL got=0xD754 want=0x7365 -> NAK (expect retransmit)     × 8 次
+[OTA] frame 0 gave up after 8 tries -> abort
+[BL] slot B ... first=0xFFFFFFFF reset=0xFFFFFFFF -> blank (never programmed)
+[BL] slot B became INVALID during the update window -> NOT jumping             ← 不跳（S7 修的）
+[BL] NOTE: falling back to slot A because slot B is not bootable
+[BL] JUMP -> slot A @0x0800C000 ... entry=0x0800E4C1                           ← 回退到 A
+```
+
+`--corrupt` 模式会**换成另一套判据**（"该失败的地方失败了"才算过）：设备回了 `NAK` /
+设备自己的重传预算用尽后中止 / 坏帧没被接受 / 没走提交安装 / **没有跳进那个刚被判坏的槽**。
+⚠️ 这套判据**在失败退出路径上也会打印**，所以别只看 `returncode`。
+
+🔴 **`--corrupt` 的字节改动必须发生在算完 CRC 之后**（改帧内 payload、CRC 保持旧值）。
+先改 payload 再 `build_frame()` 的话，CRC 会照改后的数据重算 ⇒ 帧**自洽** ⇒ 设备**正确地**收下，
+测出来的根本不是帧层拒收（2026-10-16 首跑就踩了这个坑）。
+
+🔴 **残余（留给固件侧 `S8`）**：`--corrupt 20`（写到一半才失败）时，槽里"向量表完好、内容半截"，
+`BL_ImageCheck()` 只看头 8 字节 ⇒ 仍判 `valid` ⇒ **仍会 `JUMP -> slot B`**，之后板子**串口一个字都没有**。
+此时那条判据会 **FAIL**（4 PASS / 1 FAIL）—— 这是**预期**，见 `MVP/docs/context/RUNBOOK.md` **R13.12** 与 `RISKS` **R22**。
+
+> 🔎 顺带一个反例教科书：`--corrupt 0` 之后 Slot B 是**空白**的，`active_slot` 仍是 `B` ⇒
+> 下次上电会 `falling back to slot A`。想恢复成"从 B 起"，**再跑一次不带 `--corrupt` 的正常升级**即可。
+
 **三个必须知道的坑**：
 
 | 现象 | 原因 / 对策 |
 |---|---|
 | 一直是 `🔴 没能进入升级模式` | `u` **只在上电后 2 秒内喊得到**（只要槽里有合法镜像，Bootloader 几毫秒就跳走了）。要么加 `--stlink-reset`，要么手按 RESET —— **单发一次 `u` 再傻等是错的**，脚本因此是"一直喊" |
-| `🔴 第 N 帧连发 5 次都被拒` | 帧对不上（CRC16 或 seq）。**这就是 `S7` 要验的行为** —— 故意用 `--corrupt N` 复现，此时设备应当拒绝且**不改元数据**、下次上电仍跑旧版本 |
+| `🔴 第 N 帧连发 5 次都被拒` | 帧对不上（CRC16 或 seq）。**这就是 `S7` 要验的行为** —— 故意用 `--corrupt N` 复现（见 §12.1），此时设备应当拒绝且**不改元数据**、下次上电仍跑旧版本 |
+"
+    "| `[OTA] not a start line: "us42788,…"` | 喊 `u` 的轮询与握手行**撞车**（进去那一刻还有一句 `u\n` 在路上，`\n` 被 UART 溢出吃掉 ⇒ 两行粘连），而设备**只等 1 s 就 abort**。已加三道防线：见到 `[OTA] send:` 后 `drain 0.5 s` / 握手行**前置 `\n`** / 6 s 未接受则**重发 ≤3 次** |
 | 发了 SlotA 版镜像 | 设备会在 `[OTA] readback crc32 ... MISMATCH` 处拒收（链接基址不同，跳过去必崩，靠校验拦住） |
 
 > 🔴 **升级完 `active_slot` 就变成 B 了**，而且**没有命令能改回 A**（`m` 只会重写当前元数据）。
 > 回退路径见 `RUNBOOK.md` **R13.11** 末尾（ST-Link 烧回 / 等 `S8` 的回滚）。
-> ⚠️ 已知局限：目标槽固定 Slot B ⇒ 一旦 `active_slot=B`，**中途失败**的升级会污染正在运行的槽，
-> 靠"回退到另一槽"兜底 —— 见 `RUNBOOK.md` **R13.10.6**。
+> ⚠️ 已知局限：目标槽固定 Slot B ⇒ 一旦 `active_slot=B`，**中途失败**的升级会污染正在运行的槽。
+> 🔴 **"靠回退到另一槽兜底"只对了一半**（`S7` 实测更正）：只有目标槽**真的不可启动**才会回退；
+> "写了一半但向量表完好"的槽仍会被跳进去（板子静默）⇒ 见 `RUNBOOK.md` **R13.10.6 / R13.12**、`RISKS` **R22**。
 
 ## 命令行参数
 

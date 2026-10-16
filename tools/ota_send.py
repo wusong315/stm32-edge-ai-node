@@ -183,6 +183,46 @@ def pick_port():
     raise SystemExit("自动找串口失败（候选：%s），请用 --port 指定" % cand)
 
 
+def evaluate(lines, corrupt):
+    """机器判据（不靠肉眼看）。`--corrupt` 模式判「S7 坏包拒收」，否则判「S6 升级成功」。
+
+    ⚠️ **失败路径上也要调用它** —— S7 想看的恰恰是"该失败的地方失败了"，
+       不打印就等于白跑一趟（2026-10-16 第一版就踩了这个：坏帧路线提前 `return 2`，
+       判据块根本没打印）。返回 True = 全部通过。
+    """
+    if corrupt is not None:
+        title = "S7 判据（坏包拒收 / 重传 / 中止 / 不置标志）"
+        checks = [
+            ("设备对坏帧回了 NAK（帧层 CRC16 真的在工作）",
+             "crc16 FAIL" in lines and "-> NAK" in lines),
+            ("设备自己的重传预算用尽后中止（gave up -> abort）",
+             "gave up after" in lines and "-> abort" in lines),
+            ("坏帧始终没有被接受（没有 [OTA] staged:）", "[OTA] staged:" not in lines),
+            ("没有走提交/安装步骤（没有 install: active_slot）",
+             "install: active_slot" not in lines),
+            ("没有跳进那个刚被判坏的槽（没有 JUMP -> slot B）",
+             "JUMP -> slot B" not in lines),
+        ]
+    else:
+        title = "S6 判据"
+        checks = [
+            ("读完回 CRC32 与声明值一致", "[OTA] readback crc32" in lines and "MATCH" in lines),
+            ("已置 update_pending=1",     "[OTA] staged: update_pending=1" in lines),
+            ("复位后走到提交步骤",         "update_pending=1 -> verify slot B" in lines),
+            ("active_slot 切到 B",         "install: active_slot A -> B" in lines
+                                          or "install: active_slot B -> B" in lines),
+            ("真的跳到 Slot B",            "JUMP -> slot B" in lines),
+            ("App 横幅出现（新镜像在跑）", "=== stm32-edge-ai-node boot ===" in lines),
+        ]
+    print("\n================ %s ================" % title)
+    allok = True
+    for name, ok in checks:
+        print("  [%s] %s" % ("PASS" if ok else "FAIL", name))
+        allok = allok and ok
+    print("================ %s ================" % ("全部通过" if allok else "有未通过项"))
+    return allok
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="S6 串口升级：把 .bin 灌进 Bootloader 的 Slot B",
@@ -195,7 +235,8 @@ def main():
     ap.add_argument("--wait", type=float, default=40.0, help="等 'u' 窗口的总秒数（默认 40）")
     ap.add_argument("--tail", type=float, default=8.0, help="升级后继续抓串口的秒数（默认 8）")
     ap.add_argument("--corrupt", type=int, default=None,
-                    help="故意把第 N 帧（0 起）的 payload 首字节改掉 —— 给 S7 用")
+                    help="故意把第 N 帧（0 起）的 payload 首字节改掉、"
+                         "且**不改 CRC** ⇒ 帧自相矛盾，设备应在帧层拒绝。给 S7 用")
     ap.add_argument("--stlink-reset", action="store_true",
                     help="用 ST-Link 自动复位一次，省得手按板上的 RESET")
     ap.add_argument("--stlink-cli", default=STLINK_CLI,
@@ -222,8 +263,8 @@ def main():
           % (nframes, CHUNK, n + nframes * 7, 100.0 * (n + nframes * 7) / n))
     print("估算  : 115200-8N1 约 %.1f s（不含擦除）" % ((n + nframes * 7) * 10.0 / 115200))
     if args.corrupt is not None:
-        print("⚠️  --corrupt %d：第 %d 帧每次都被改坏，设备应当**一直 NAK 并最终放弃**"
-              % (args.corrupt, args.corrupt))
+        print("⚠️  --corrupt %d：第 %d 帧的 payload 首字节被改坏、**CRC 保持旧值** ⇒ "
+              "帧自相矛盾，设备应当在帧层 NAK 并最终放弃" % (args.corrupt, args.corrupt))
     if args.dry_run:
         print("---- dry-run：首帧 = %s" % build_frame(0, blob[:CHUNK]).hex()[:64])
         print("---- dry-run：起始行 = %r" % build_start_line(n, crc, args.ver))
@@ -277,11 +318,24 @@ def main():
         return 2
 
     # ---- 2) 起始行 ----------------------------------------------------
+    # 🔴 2026-10-16 踩到：喊 'u' 的循环与握手行**会撞车**。
+    #    设备刚进 OTA、我们那句 wait_for 返回的同时，可能还有一个 `u\n` 在路上；
+    #    若它的 `\n` 被 UART 溢出吃掉，两行就粘成 `us42788,...`，
+    #    设备解不出来 —— 而它**只等 1 s 就会 abort**（`BL_OTA_LINE_TIMEOUT_MS`）。
+    #    两道防线：
+    #      ① 先 drain 一会儿，把在途的杂散 'u' 全收干净，再发握手；
+    #      ② 每次发握手都**前置一个 `\n`**，即使还有残渣也断得开；
+    #      ③ 没被接受就重发（设备侧对"坏行"有 8 次预算，只要别让它空等 1 s）。
     line = build_start_line(n, crc, args.ver)
     print("\n>> 起始行: %r" % line)
-    ser.write(line.encode("ascii"))
-
-    got = dev.wait_for("[OTA] erased OK", 40.0)
+    dev.drain(0.5)                       # ① 收干净在途的杂散 'u'
+    got = None
+    for attempt in range(3):
+        ser.write(b"\n" + line.encode("ascii"))     # ② 前置 \n 防粘连
+        got = dev.wait_for("[OTA] erased OK", 6.0)
+        if got:
+            break
+        print("   ... 起始行没被接受，重发（第 %d 次）" % (attempt + 2))
     if not got:
         print("\n🔴 擦除/握手没有成功（上面有设备的原话）")
         return 2
@@ -291,11 +345,18 @@ def main():
     t0 = time.time()
     sent = 0
     for seq in range(nframes):
-        payload = bytearray(blob[seq * CHUNK:(seq + 1) * CHUNK])
-        if args.corrupt is not None and seq == args.corrupt:
-            payload[0] ^= 0xFF
+        payload = blob[seq * CHUNK:(seq + 1) * CHUNK]
+        frame = build_frame(seq, payload)
 
-        frame = build_frame(seq, bytes(payload))
+        # 🔴 `--corrupt` 必须**在算完 CRC 之后再动字节**（2026-10-16 踩过）：
+        #    若先改 payload 再 `build_frame()`，CRC16 会**照着改坏后的数据重算**，
+        #    帧仍然自洽 ⇒ 设备逐帧校验**正确地通过**，测出来的根本不是"帧层拒收"。
+        #    这里改成"改字节但不改 CRC" —— 这才是真实链路上的传输误码模型。
+        if args.corrupt is not None and seq == args.corrupt:
+            f = bytearray(frame)
+            f[HDR_LEN] ^= 0xFF
+            frame = bytes(f)
+
         tried = 0
         while True:
             ser.write(frame)
@@ -305,14 +366,16 @@ def main():
             if tok == NAK:
                 tried += 1
                 if tried > args.retries:
-                    print("🔴 第 %d 帧连发 %d 次都被拒（设备也放弃了）" % (seq, tried))
+                    print("🔴 第 %d 帧连发 %d 次都被拒（对端也放弃了）" % (seq, tried))
                     dev.drain(4.0)
-                    return 2
+                    # 🔴 退出码要跟着**判据**走，不是跟着"有没有升级成功"走：
+                    #    S7 模式下"该失败的地方失败了"就是成功，必须返回 0。
+                    return 0 if evaluate("\n".join(dev.lines), args.corrupt) else 2
                 print("   ... 第 %d 帧被 NAK，重发（第 %d 次）" % (seq, tried + 1))
                 continue
             print("🔴 第 %d 帧等不到应答（token=%r）" % (seq, tok))
             dev.drain(3.0)
-            return 2
+            return 0 if evaluate("\n".join(dev.lines), args.corrupt) else 2
         sent += len(payload)
         if (seq + 1) % 8 == 0 or seq == nframes - 1:
             el = time.time() - t0
@@ -323,25 +386,13 @@ def main():
     dev.drain(args.tail)
 
     # ---- 4) 判据（机器判，不靠肉眼看）--------------------------------
-    lines = "\n".join(dev.lines)
-    checks = [
-        ("读完回 CRC32 与声明值一致", "[OTA] readback crc32" in lines and "MATCH" in lines),
-        ("已置 update_pending=1",     "[OTA] staged: update_pending=1" in lines),
-        ("复位后走到提交步骤",         "update_pending=1 -> verify slot B" in lines),
-        ("active_slot 切到 B",         "install: active_slot A -> B" in lines
-                                      or "install: active_slot B -> B" in lines),
-        ("真的跳到 Slot B",            "JUMP -> slot B" in lines),
-        ("App 横幅出现（新镜像在跑）", "=== stm32-edge-ai-node boot ===" in lines),
-    ]
-    print("\n================ S6 判据 ================")
-    allok = True
-    for name, ok in checks:
-        print("  [%s] %s" % ("PASS" if ok else "FAIL", name))
-        allok = allok and ok
-    print("================ %s ================" % ("全部通过" if allok else "有未通过项"))
-    if allok:
+    allok = evaluate("\n".join(dev.lines), args.corrupt)
+    if allok and args.corrupt is None:
         print("⚠️ 板上现在是「Bootloader + Slot A + Slot B」且 active_slot=B。")
         print("   要回到从 A 启动：走 RUNBOOK R13.2 用 ST-Link 烧回，或等 S8 的回滚。")
+    if allok and args.corrupt is not None:
+        print("⚠️ 目标槽 Slot B 已被擦除/写坏但**没有安装**；active_slot 仍是原值，")
+        print("   下次上电应回退到另一槽（若目标槽本身已不可启动）。")
     return 0 if allok else 2
 
 
