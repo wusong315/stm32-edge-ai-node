@@ -260,8 +260,31 @@ def ramp_to(ser, current, target, step, delay):
     return v
 
 
+def flush_input(ser) -> int:
+    """清空串口输入缓冲，返回丢掉的字节数（读不到就返回 -1）。
+
+    必须在每次 `capture()` 之前调用。原因：`time.sleep(settle)` 期间固件一直
+    在发帧而这里没人读，驱动缓冲会积压 ≈ `settle × rate` 个采样点。不清掉的话：
+      · `capture()` 的 `wall` 只反映"把积压读出来"的耗时（实测 4.608 s 的数据
+        只花 1.5 s 壁钟 ⇒ 报告里那栏 `wall_s` 是假的）；
+      · 采到的段还会混进 settle 期的样本，"每档互相独立"这个前提就松了。
+    """
+    try:
+        left = int(getattr(ser, "in_waiting", 0) or 0)
+        if hasattr(ser, "reset_input_buffer"):
+            ser.reset_input_buffer()
+        elif left:
+            ser.read(left)
+        return left
+    except Exception:
+        return -1
+
+
 def capture(ser, parser, want_samples: int, timeout: float):
-    """收够 `want_samples` 个采样点（或超时）→ `(frames, wall_seconds)`。"""
+    """收够 `want_samples` 个采样点（或超时）→ `(frames, wall_seconds)`。
+
+    ⚠️ 调用前先 `flush_input(ser)`，否则 wall 会偏小、且样本混入 settle 期数据。
+    """
     frames = []
     got = 0
     t0 = time.time()
@@ -535,6 +558,10 @@ def main(argv=None) -> int:
         for duty in duties:
             cur = ramp_to(ser, cur, duty, args.ramp_step, args.ramp_delay)
             time.sleep(args.settle)
+
+            # 🔴 settle 期间固件一直在发帧而这里没读 → 驱动缓冲积压 ≈ settle×rate 个点。
+            #    先清掉，wall 才反映真实采样时长（实测不清：4.6 s 的数据只报 1.5 s 壁钟）。
+            flush_input(ser)
 
             parser = vf.FrameParser()
             frames, wall = capture(ser, parser, want, timeout)
