@@ -1,6 +1,8 @@
 # ===== 编译输出（不提交）=====
 Debug/
 Release/
+SlotA/
+SlotB/
 build/
 *.o
 *.d
