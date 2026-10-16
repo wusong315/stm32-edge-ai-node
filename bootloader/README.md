@@ -1,4 +1,4 @@
-# bootloader —— OTA Bootloader 工程（**S3 已完成**）
+# bootloader —— OTA Bootloader 工程（**S6 已完成：串口升级真机闭环**）
 
 > 📍 **本目录是 `stm32-edge-ai-node` 仓库里的第二个 CubeIDE 工程**，不是 App 的子模块。
 > 布局对齐参考仓库 `D:\refs\STM32F407VGT6-FOTA-with-DualSlot`（`Bootloader/` + `Application/` 平级）。
@@ -27,65 +27,86 @@
 
 ---
 
-## 2. 当前进度：**S3**（推演稿 §7）
+## 2. 当前进度：**S6**（推演稿 §7）
 
 | 项 | 结果 |
 |---|---|
-| 命令行编译 | ✅ **0 error / 0 warning**，`make clean && make all` 全量重编（25 个目标文件） |
+| 命令行编译 | ✅ **0 error / 0 warning**，`make clean && make all` 全量重编（26 个目标文件） |
 | `.isr_vector` VMA | ✅ `0x08000000`（`objdump -h` 实测） |
-| 向量表内容 | ✅ 初始 MSP `0x20020000`（RAM 顶）+ Reset 向量 `0x08001D41`（奇数、落在本区） |
-| Flash 占用 | ✅ **24 012 B ≈ 23.45 KB / 32 KB（73.3 %）**，最高占用地址 `0x08005DD4` |
-| ↳ 距参数区起点 | ✅ 还差 **8 748 B ≈ 8.54 KB** 才碰到 `0x08008000`（32 K 链接上限即是硬护栏） |
-| RAM 占用 | ✅ `data 140 + bss 1 988 = 2 128 B`（其中 1 536 B 是 `.ld` 预留的 heap+stack） |
-| App 工程影响 | ✅ **零改动**（App 全量重编 `42 240 + 528 = 42 768 B` / RAM 3 976 B，与施工前**逐字节一致**） |
+| 向量表内容 | ✅ 初始 MSP `0x20020000`（RAM 顶）+ Reset 向量（奇数、落在本区） |
+| Flash 占用 | 🔴 **29 756 B ≈ 29.06 KB / 32 KB（90.8 %）**，最高占用地址 `0x08007444` |
+| ↳ 距参数区起点 | 🔴 只剩 **3 004 B** 才碰到 `0x08008000`（`FLASH LENGTH = 32K` 仍是硬护栏） |
+| RAM 占用 | ✅ `data 140 + bss 3 012 = 3 152 B`（含 `.ld` 预留的 heap 512 + stack 1 024；**新增的 1 024 B 是收包缓冲，必须是 `static`**） |
+| 串口升级（`S6`） | 🎉 **2026-10-16 一次跑通，6/6 判据全过**：42 帧 / 42 788 B / 4.1 s / 10.2 KB·s⁻¹；读完回 CRC32 `MATCH`；ST-Link 把 Slot B 读回**逐字节相同**；复位后 `active_slot=B` 并跳到 B |
 
 > ⚠️ 以上是 **Debug（`-O0`）** 的体积。Release（`-Os`）会明显更小 —— 但 Bootloader 本来就跑在启动关键路径上，
 > 「Debug 版也塞得下 32 KB」是更强的结论，所以以 Debug 数字为准。
 
-> 🔴 **预算提醒（给 S6 的）**：S2→S3 用掉 9 868 B，其中我们自己的 5 个模块合计 7 985 B
-> （`bl_boot` 3 293 / `bl_meta` 2 682 / `bl_flash` 1 409 / `bl_jump` 601）。
-> 余量 8.54 KB。S6（串口收包协议 + 写 Slot B）也吃这一块，
-> **但不会悄悄撑破**：`.ld` 的 `FLASH LENGTH = 32K` 会在**链接期直接报错**。
-> 真到那天，退路依次是：① 本工程改 `-Os`；② 精简日志文案（`.rodata` 占 3 364 B）。
+> 🔴 **预算账（`RISKS` R21 的实测答案）**：`S3`→`S6` 用掉 **+5 744 B**，其中 **约 2.6 KB 是 `.rodata`（日志文案）** ——
+> 也就是说「多打印几行」和「多写一个函数」是同一量级的代价，**日志不是免费的**。
+> 余量 **3 004 B**。`S7`（坏包拒收）**已经在 `S6` 里实现了、不需要新代码**，余量只留给 `S8`（回滚）。
+> 真到编不下那天，退路依次是：① 本工程改 `-Os`（**未用过，依然完好**）；② 精简日志文案；③ 极端情况才动分区表。
 
 ---
 
-## 3. S3 的代码结构（5 个模块，职责单一）
+## 3. 代码结构（6 个模块，职责单一）
 
 ```
 Core/Src/
   main.c      最小初始化（GPIO + USART1）→ BL_Run()
-  bl_boot.c   编排：横幅 → 分区表自检 → CRC 自检 → 读/自愈元数据 → 决策 → 跳或等
-  bl_flash.c  【新】扇区层：地址↔扇区号派生 / 擦除 / 编程 / 分区表机器自检
-  bl_meta.c   【新】元数据层：CRC32 + 顺序追加日志 + 自愈 + 写后读回校验
-  bl_jump.c   【新】跳转层：镜像校验 + 外设 DeInit + 跳转
-Core/Inc/  同名头文件 + bl_config.h（分区表唯一来源）
+  bl_boot.c   编排：横幅 → 分区表自检 → 两个 CRC 自检 → 读/自愈元数据
+              → 升级提交（update_pending→active_slot）→ 决策 → 上电升级窗口 → 跳或等
+  bl_flash.c  扇区层：地址↔扇区号派生 / 擦除 / 编程 / 分区表机器自检
+  bl_meta.c   元数据层：CRC32 + 顺序追加日志 + 自愈 + 写后读回校验
+  bl_jump.c   跳转层：镜像校验 + 外设 DeInit + 跳转
+  bl_ota.c    【S6 新增】串口升级：帧层 CRC16 + 文本握手 + 停等收帧
+              + 写 Slot B + 读回整镜像 CRC32 + 置 update_pending
+Core/Inc/  同名头文件 + bl_config.h（分区表唯一来源）+ bl_ota.h（**帧格式唯一来源**）
 ```
 
-三层拆开是为了**后面几步能直接复用**：`bl_flash.c` 的擦/写就是 S6 写 Slot B 要用的，
-`bl_jump.c` 的校验/跳转就是 S8 回滚要用的。
+三层拆开是为了**每一步都能直接复用**：`bl_flash.c` 的擦/写被 `bl_ota.c` 直接用；
+`bl_jump.c` 的校验被 `bl_ota.c` 的"写完再判能不能跳"和 `bl_boot.c` 的回退分支共用。
 
-### S3 启动时序（串口上能看到的）
+### 启动时序（串口上能看到的）
 
 ```
-横幅(v0.3 + 构建时间 + SYSCLK + 分区表)
+横幅(v0.4 + 构建时间 + SYSCLK + 分区表)
   └─ flash map verify   ← 逐个分区：由地址反推的扇区号 == 期望值？+ 是否整数个完整扇区？
-  └─ crc32 selftest     ← "123456789" -> 0xCBF43926 ?（元数据完整性全靠它，先证明它是对的）
+  └─ crc32 selftest     ← "123456789" -> 0xCBF43926 ?（元数据完整性全靠它）
+  └─ crc16 selftest     ← "123456789" -> 0xBB3D ?（升级帧层完整性全靠它）
   └─ metadata region raw head + scan 统计
   └─ 无有效记录 ⇒ self-heal（擦 S2 + 写默认值）⇒ 写后读回校验 ⇒ 再扫一次
-  └─ slot probe A / B   ← 只读
-  └─ boot decision      ← 合法就跳；不合法 ⇒ safe wait（LED 1 Hz 慢闪 + 串口命令）
+  └─ update_pending=1 ⇒ 复验 Slot B ⇒ 提交（active_slot→B、清标志）→ **重新扫一遍元数据**
+  └─ boot decision      ← 合法就跳（**跳之前先开 2 s 升级窗口**）；不合法 ⇒ safe wait
 ```
 
-### 安全等待模式下的串口命令（S6 会在此扩展）
+### 串口命令（`?` 可随时看）
 
 | 键 | 作用 |
 |---|---|
 | `?` | 帮助 |
-| `m` | **重写元数据 + 读回校验**（判据②的"随取随验"入口，不必重新上电） |
+| **`u`** | **进入串口升级模式**（`S6`）—— 上电窗口里、或安全等待模式里都能用 |
+| `m` | **重写元数据 + 读回校验**（"写→读回→CRC 一致"的随取随验入口，不必重新上电） |
 | `r` | 重新扫描元数据 + 打印两个槽状态 |
 
-等待时**每秒重看一眼目标槽**：S6 收到新镜像后可以**原地跳走，不需要复位**。
+> 🔴 **`u` 只在上电后那 2 s 窗口里喊得到**（`BL_OTA_WINDOW_MS`）。原因：只要目标槽合法，
+> `BL_BootDecision()` 几毫秒就跳走了，PC 根本插不进来 —— **没有这个窗口，串口升级这条路就不存在**。
+> 上位机 `tools/ota_send.py` 的做法是**一直喊**（每 200 ms 一次）并让 ST-Link 复位一次去撞这个窗口。
+
+### 串口升级（`S6`）的协议与三条纪律
+
+**帧格式的权威在 `Core/Inc/bl_ota.h` 的头部注释**，实现与"为什么这么设计"在 `Core/Src/bl_ota.c` 的头部注释；
+操作步骤与实测记录在 `MVP/docs/context/RUNBOOK.md` **R13.10 / R13.11**。这里只留最该记住的三条：
+
+1. **必须停等**（一帧一个 `'K'`）：F4 擦/写期间 CPU 取不了指，而 UART 的 RX 寄存器只有 **1 个字节** ⇒
+   流式灌必然**静默丢字节**。停等把"设备忙"变成"主机在等"，零流控绕开。
+2. **收数据期间一个字节都不许打印**：`printf` 阻塞 TX 好几毫秒，同样会丢。
+3. **两层校验各管一件事**：逐帧 `CRC16` 管**传输**（坏帧进不了 Flash，`NAK` 让主机重发）；
+   收完再从 Flash **读回整段重算 `CRC32`** 管**落盘**。只有后者过才置 `update_pending`。
+
+> ⚠️ **升级目标槽当前固定是 Slot B**，且必须发 **SlotB 链接版镜像**（`SlotB/stm32-edge-ai-node.elf` → `objcopy -O binary`）。
+> 一旦 `active_slot=B`，中途失败的升级会污染**正在运行的槽**，目前靠"回退到另一槽"兜底 ——
+> 这是**已识别、刻意未修**的局限，正解（目标槽取非活动槽）留给 `S7`/`S8`，见 `RUNBOOK.md` **R13.10.6**。
 
 ---
 
@@ -157,9 +178,14 @@ ARM=<CubeIDE>/STM32CubeIDE/plugins/com.st.stm32cube.ide.mcu.externaltools.gnu-to
 $ARM/arm-none-eabi-objdump -h Debug/bootloader.elf | head -8   # .isr_vector VMA 必须 = 08000000
 $ARM/arm-none-eabi-objcopy -O binary Debug/bootloader.elf /tmp/bl.bin
 # bl.bin 的前 8 字节 = 初始 MSP + Reset 向量（后者必须是奇数）
-# 另：nm 里应有 BL_Crc32 / BL_MetaWrite / BL_MetaScan / BL_JumpToApp / BL_FlashMapVerify —— 
+# 另：nm 里应有 BL_Crc32 / BL_MetaWrite / BL_MetaScan / BL_JumpToApp / BL_FlashMapVerify /
+#     BL_OtaRun / BlRecvFrame / BL_TryCommitUpdate / BL_OtaSelfTest ——
 #     若被 --gc-sections 收走，说明"编译过了但其实没链进去"
 ```
+
+> 🔴 **`bl_ota.c` 不能放进 `-O0` 就随便写的名单里**：它有一处**只有真机会暴露**的陷阱 ——
+> `uint8_t buf[1024]` 这种局部数组会直接吃光栈（`_Min_Stack_Size = 0x400`）。
+> 收包缓冲**必须**是 `static uint32_t wbuf[BL_OTA_CHUNK/4]`（既避开栈，又保证 `HAL_FLASH_Program` 要的 4 字节对齐）。
 
 > 🔴 **改了 `Core/Src/*.c` 的增删**（新加文件），必须同步更新
 > `Debug/objects.list` + `Debug/Core/Src/subdir.mk`。本工程的清单由
@@ -191,9 +217,13 @@ $ARM/arm-none-eabi-objcopy -O binary Debug/bootloader.elf /tmp/bl.bin
 ## 7. 施工阶段纪律（照抄推演稿 §7，**不许跳**）
 
 ```
-S1 分区表定稿 ✅  →  S2 建工程+编译 ✅  →  S3 元数据+校验+跳转 ✅  →  S4 App 双配置
-  →  S5 烧 Slot A（⚠️ 最危险）  →  S6 串口升级  →  S7 坏包拒收  →  S8 回滚
+S1 分区表定稿 ✅  →  S2 建工程+编译 ✅  →  S3 元数据+校验+跳转 ✅  →  S4 App 双配置 ✅
+  →  S5 烧 Slot A（⚠️ 最危险）✅  →  S6 串口升级 ✅  →  S7 坏包拒收  →  S8 回滚
 ```
+
+> 📌 **`S7` 的代码在 `S6` 里就有了**（逐帧 CRC16 → `NAK` → 重传 → 用尽即中止且不置标志），
+> 差的只是**按判据跑一遍**：`tools/ota_send.py --corrupt <N>`。
+> **`S8`（回滚）** 还缺"App 起来后回来确认"的那一环 —— `boot_attempts` / `max_boot_attempts` 字段与提交时的清零已就位。
 
 🔴 **一旦把 Bootloader 烧进 `0x08000000`，原先跑在那儿的 App 就被覆盖了** ——
 这是 **`S3` 就会发生**的事（不是 `S5`）。所以**上板前**必须常备两份救砖件：
@@ -232,6 +262,10 @@ S1 分区表定稿 ✅  →  S2 建工程+编译 ✅  →  S3 元数据+校验+�
 
 - 施工顺序 / 分区表推演：`MVP/docs/plan/STM32边缘AI项目-OTA分区表推演.md`（§6 分区表、§7 顺序、§9 验证手段、§11 增量复核）
 - 分区表**数值权威**：`MVP/docs/plan/STM32边缘AI项目-OTA实施方案.md` §5
-- **操作步骤（烧录 / 接线 / 救砖 / S3 判据勘误）**：`MVP/docs/context/RUNBOOK.md` **R13**
-- 决策记录：`MVP/docs/context/DECISIONS.md` D21（分区表）、D23（Bootloader 作为仓库内独立工程）、**D24（元数据做成顺序日志 + 跳转须放开 PRIMASK）**
+- **操作步骤（烧录 / 接线 / 救砖 / 各步判据勘误）**：`MVP/docs/context/RUNBOOK.md` **R13**
+- **`S6` 串口升级：协议规格 + 三条纪律 + 已知局限**：`RUNBOOK.md` **R13.10**
+- **`S6` 实测记录（编译预算 / 完整时序 / 四条独立取证 / 回退路径）**：`RUNBOOK.md` **R13.11**
+- 上位机：`tools/ota_send.py`（`--selftest` 固定向量 / `--dry-run` / `--corrupt N` 给 `S7` / `--stlink-reset`）
+- 决策记录：`MVP/docs/context/DECISIONS.md` D21（分区表）、D23（Bootloader 作为仓库内独立工程）、
+  D24（元数据做成顺序日志）、**D25（跳转须放开 PRIMASK）**、D26（本工程禁 `%f`）、D27（槽间差异是三项）
 - 参考仓库速读：`MVP/docs/plan/REF-F4-NANOEDGE.md` 与 `REF-REPOS-P1-2.md`

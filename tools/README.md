@@ -33,6 +33,7 @@ D:\STM32Projects\pc-venv\Scripts\python.exe
 | `check_pwm_cmd.py` | **PWM 命令通路验收**：不需要电机/电池的第 ⑦ 步验收（横幅 → `dNN` 回显 → `?` 信息行 → 归零）；`--led-test` 是第 ③ 步的 LED 目视验收；`--set NN` 停在某档不归零，配合万用表量电压 |
 | `calib_dev.py` | **六姿态静态标定**：把零偏 `b` 与增益 `k` **分开**（单姿态解不出来），产出 `calib.json` + C 头文件片段，并带**独立验证**（T3）；`--watch` 可实时看三轴、`--identify` 可先告诉你"手上这个面是哪个姿态" |
 | `watch.cmd` | **双击即可**的启动器 → `calib_dev.py --watch`（串口自动挑；`.cmd` 内**故意只用 ASCII**，中文输出全由 Python 负责） |
+| `ota_send.py` | **串口升级（OTA / `S6`）**：把一份 `.bin` 分包灌进 **Bootloader 的 Slot B**，停等重传 + 全程打印设备日志 + **升级后自动判定 6 条判据**；`--selftest` 帧格式固定向量、`--dry-run` 只算不发、`--corrupt N` 给 `S7` 用、`--stlink-reset` 省得手按 RESET |
 | `selftest.py` | **自测**：317 条断言，不需要硬件 |
 
 ## 先跑自测（每次改完代码都该跑）
@@ -536,6 +537,49 @@ COM4  115200  8N1       # 直接看原始数据行
 | `打不开 COM5：口不存在或已被拔掉` | 换 USB 口会换号（COM6/COM7…）→ `--list-ports` 看它现在叫什么 |
 | 一行数据都没有、`无法解析` 也在涨 | 波特率不对，或 `APP_OUTPUT_MODE` 与解析方式不匹配 |
 | `t=…` 一直在刷但 ax/ay/az 全是 0 | mode 2/3 二进制档下不会有文本 —— 切回 mode 0/1 |
+
+### 12) 串口升级（OTA · `S6`）：把新固件灌进 Slot B
+
+**这是 `ota_send.py` 的活**，与上面 1)–11) 那套"采数据"工具是两回事：上面都在 App 里跑，
+这个是**让 Bootloader 从 PC 收一份新固件**。
+
+**前置**（少一个都白跑）：
+
+1. 板上跑的是 **Bootloader**（不是 App）—— 看横幅是不是 `=== stm32-ota-bootloader vX.Y ===`；
+2. **CH340** 接好（`TXD→PA10` / `RXD→PA9` / `GND`），串口 115200-8N1；
+3. 要发的是 **SlotB 链接版**镜像（`.isr_vector` VMA = `0x08060000`）—— 发错了会在"读完回 CRC32"那步被拦下；
+4. App 还在跑的话，**先发 `d0`** 把 PWM 归零（`RUNBOOK` R13.5：Bootloader 跳转前 DeInit 后 `PA6` 会停在最后一次比较电平）。
+
+```bash
+cd D:\STM32Projects\stm32-edge-ai-node
+
+# ① 先自己自检（不碰硬件）：3 条固定向量全 PASS 才算工具本身是对的
+D:\STM32Projects\pc-venv\Scripts\python.exe tools\ota_send.py --selftest
+
+# ② 只算不发：看长度 / CRC32 / 帧数 / 时间估算（对不上就先别发）
+D:\STM32Projects\pc-venv\Scripts\python.exe tools\ota_send.py \
+  --bin "D:\STM32Projects\_tmp\app_slotB.bin" --ver 2 --dry-run
+
+# ③ 真升级：脚本会一直喊 'u'，并让 ST-Link 自动复位一次去撞那 2 秒的升级窗口
+D:\STM32Projects\pc-venv\Scripts\python.exe tools\ota_send.py \
+  --port COM5 --bin "D:\STM32Projects\_tmp\app_slotB.bin" --ver 2 --stlink-reset
+```
+
+**跑完会自动判 6 条**（不靠肉眼看）：读完回 CRC32 与声明值一致 / 已置 `update_pending=1` /
+复位后走到提交步骤 / `active_slot` 切到 B / 真的跳到 Slot B / App 横幅出现。**全过才退出码 0。**
+
+**三个必须知道的坑**：
+
+| 现象 | 原因 / 对策 |
+|---|---|
+| 一直是 `🔴 没能进入升级模式` | `u` **只在上电后 2 秒内喊得到**（只要槽里有合法镜像，Bootloader 几毫秒就跳走了）。要么加 `--stlink-reset`，要么手按 RESET —— **单发一次 `u` 再傻等是错的**，脚本因此是"一直喊" |
+| `🔴 第 N 帧连发 5 次都被拒` | 帧对不上（CRC16 或 seq）。**这就是 `S7` 要验的行为** —— 故意用 `--corrupt N` 复现，此时设备应当拒绝且**不改元数据**、下次上电仍跑旧版本 |
+| 发了 SlotA 版镜像 | 设备会在 `[OTA] readback crc32 ... MISMATCH` 处拒收（链接基址不同，跳过去必崩，靠校验拦住） |
+
+> 🔴 **升级完 `active_slot` 就变成 B 了**，而且**没有命令能改回 A**（`m` 只会重写当前元数据）。
+> 回退路径见 `RUNBOOK.md` **R13.11** 末尾（ST-Link 烧回 / 等 `S8` 的回滚）。
+> ⚠️ 已知局限：目标槽固定 Slot B ⇒ 一旦 `active_slot=B`，**中途失败**的升级会污染正在运行的槽，
+> 靠"回退到另一槽"兜底 —— 见 `RUNBOOK.md` **R13.10.6**。
 
 ## 命令行参数
 

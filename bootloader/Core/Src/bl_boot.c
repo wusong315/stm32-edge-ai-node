@@ -3,25 +3,35 @@
   * @file    bl_boot.c
   * @brief   Bootloader 主流程。
   *
-  * @note    🔴 施工阶段（推演稿 §7）：**本文件当前到 S3 的范围**。
-  *
-  *          S3 = "读元数据 → 校验镜像 → 合法才跳 / 不合法就留在原地"。
-  *          🔴 与推演稿原文的差别（重要，见 `RUNBOOK.md` R13.3）：
-  *          原稿写"只跳 0x08000000（即现在的 App）"，且判据是"串口仍打 M1 横幅"。
-  *          **这两句都做不到**：① 跳 0x08000000 = 跳进自身复位入口（Bootloader 就占那儿）；
-  *          ② 把 Bootloader 烧到 0x08000000 这个动作本身就把原来的 App 覆盖了。
-  *          ⇒ 判据改到"**不跳**"这一侧：Slot A 此时还是空白，所以正确的现象是
-  *            **明确打印 invalid 并停住**，而板上不再有 M1 横幅是**预期**。
-  *
-  *          S3 仍然**不写除了参数区以外**的任何 Flash、不碰 App 槽。
-  ******************************************************************************
-  */
+ * @note    🔴 施工阶段（推演稿 §7）：**本文件当前到 S6 的范围**。
+ *
+ *          S3 = "读元数据 → 校验镜像 → 合法才跳 / 不合法就留在原地"。
+ *          ✅ S5 已真机闭环（把 Slot A 版 App 烧到 `0x0800C000`，跳过去运行正常）。
+ *          S6 = "串口收新镜像 → 写 Slot B → 校验 → 置标志 → 复位 → 提交安装"。
+ *               协议与实现都在 `bl_ota.c`；本文件只负责**编排**：
+ *               ① 上电留一段升级窗口（否则 Slot A 合法就秒跳，PC 没机会插进来）；
+ *               ② 复位后若发现 `update_pending=1`，先"提交"再决定跳哪个槽。
+ *
+ *          🔴 S3 时期与推演稿原文的差别（重要，见 `RUNBOOK.md` R13.3）：
+ *          原稿写"只跳 0x08000000（即现在的 App）"，且判据是"串口仍打 M1 横幅"。
+ *          **这两句都做不到**：① 跳 0x08000000 = 跳进自身复位入口（Bootloader 就占那儿）；
+ *          ② 把 Bootloader 烧到 0x08000000 这个动作本身就把原来的 App 覆盖了。
+ *          ⇒ 判据改到"**不跳**"这一侧：Slot A 此刻还是空白，所以正确的现象是
+ *            **明确打印 invalid 并停住**，而板上不再有 M1 横幅是**预期**。
+ *
+ *          🔴 写元数据的时机现在有**三个**，别再多加：
+ *            ① 自愈（空白片）；② S6 的"置标志"（`bl_ota.c`）；
+ *            ③ S6 的"提交"（本文件 `BL_TryCommitUpdate()`，复位后只跑一次）。
+ *            任何"自动切换"都必须落在这三处，否则"到底哪一步改了状态"就说不清了。
+ ******************************************************************************
+ */
 #include "main.h"
 #include "bl_boot.h"
 #include "bl_config.h"
 #include "bl_flash.h"
 #include "bl_jump.h"
 #include "bl_meta.h"
+#include "bl_ota.h"
 
 #include <stdio.h>
 
@@ -35,7 +45,7 @@ extern UART_HandleTypeDef huart1;
  * 🔴 以后排查"到底烧进去的是哪一版"时，这一行是唯一可信的锚：
  *    别靠文件时间戳，那玩意儿在复制/解压时会变。 */
 #define BL_VERSION_MAJOR    (0U)
-#define BL_VERSION_MINOR    (3U)    /* S3：加元数据 + 校验 + 跳转 */
+#define BL_VERSION_MINOR    (4U)    /* S3：元数据 + 校验 + 跳转；S5：真机闭环；S6：串口升级 */
 
 /* =====================================================================
  * 槽表 —— 一处定义，后面只按 id 取
@@ -54,6 +64,8 @@ static const BL_Slot_t BL_Slots[2] =
 };
 
 static void BL_SafeWait(const BL_Meta_t *m, int haveMeta);
+static void BL_HandleCmd(uint8_t ch);
+static void BL_WaitUpdateWindow(void);
 
 /* =====================================================================
  * 一、横幅
@@ -61,7 +73,7 @@ static void BL_SafeWait(const BL_Meta_t *m, int haveMeta);
 static void BL_PrintBanner(void)
 {
   printf("\r\n\r\n");
-  printf("=== stm32-ota-bootloader v%u.%u (S3: metadata + verify + jump) ===\r\n",
+  printf("=== stm32-ota-bootloader v%u.%u (S6: serial OTA -> slot B) ===\r\n",
          (unsigned)BL_VERSION_MAJOR, (unsigned)BL_VERSION_MINOR);
   /* 构建时间戳同样有用：OTA 只会替换 App，Bootloader 是长期不动的，
    * 这一行能立刻回答"现在板上跑的是哪次编的 Bootloader"。 */
@@ -125,10 +137,29 @@ static void BL_HandleCmd(uint8_t ch)
   switch (ch)
   {
     case '?':
-      printf("[BL] commands: m = rewrite metadata (readback verified)\r\n");
+      printf("[BL] commands: u = enter serial update mode (S6)\r\n");
+      printf("[BL]           m = rewrite metadata (readback verified)\r\n");
       printf("[BL]           r = rescan metadata + both slots\r\n");
       printf("[BL]           ? = this help\r\n");
       break;
+
+    /* 🔴 升级入口。`BL_OtaRun()` 返回 1 = 镜像已写进 Slot B 且校验通过、
+     *    `update_pending` 已置位 ⇒ **必须复位**，让启动流程去"提交"。
+     *    直接在这里复位（而不是返回一个标志让上层处理）是刻意的：
+     *    两个入口（上电窗口 / 安全等待）都会调到这个 switch，
+     *    复位只写一处，就不可能出现"某条路径忘了复位"。 */
+    case 'u':
+    case 'U':
+    {
+      if (BL_OtaRun() != 0)
+      {
+        printf("[BL] update staged in slot B -> NVIC_SystemReset() now\r\n");
+        HAL_Delay(50U);                    /* 把最后一句日志放完再复位 */
+        NVIC_SystemReset();
+      }
+      /* 没升级成功：什么都不改，回到调用者（该跳跳、该等等）。 */
+      break;
+    }
 
     /* 🔴 'm' 是判据②的"随取随验"入口：把"写→读回→CRC 一致"整条链路
      *    再走一遍并逐项打印。这样即使过了首次上电（自愈已跑过），
@@ -175,6 +206,46 @@ static void BL_HandleCmd(uint8_t ch)
   }
 }
 
+/* =====================================================================
+ * 三·一、上电升级窗口（S6 才有的东西）
+ * =====================================================================
+ * 🔴 **为什么必须有**：只要目标槽里有合法镜像，`BL_BootDecision()` 会在
+ *    上电后**几毫秒内**就跳走 —— PC 根本来不及说话，`u` 命令永远收不到，
+ *    串口升级这条路等于不通。所以"跳之前先等一小会儿"不是花哨功能，
+ *    而是 S6 **能不能用**的前提。
+ *
+ * 代价：每次上电多等 BL_OTA_WINDOW_MS。调试期完全可接受。
+ * 期间收到别的字符照样走命令表（`?` / `m` / `r` 都能用），
+ * 收到 `u` 就进升级、并且**立刻结束窗口**（成功则内部会复位，
+ * 失败就继续正常启动，不让用户卡在这一步）。 */
+static void BL_WaitUpdateWindow(void)
+{
+  uint32_t waited = 0U;
+
+  printf("[BL] update window %u ms: send 'u' to enter serial OTA (any other key = normal boot)\r\n",
+         (unsigned)BL_OTA_WINDOW_MS);
+
+  while (waited < BL_OTA_WINDOW_MS)
+  {
+    uint8_t ch = 0U;
+
+    HAL_Delay(BL_OTA_WINDOW_POLL_MS);
+    waited += BL_OTA_WINDOW_POLL_MS;
+
+    /* 非阻塞（Timeout = 0）：窗口是"限时"的，不能被一个字节卡住。 */
+    if (HAL_UART_Receive(&huart1, &ch, 1U, 0U) == HAL_OK)
+    {
+      BL_HandleCmd(ch);                    /* 'u' 在这里会跑完整套升级流程 */
+      if ((ch == 'u') || (ch == 'U'))
+      {
+        return;                            /* 试过一次就够了，别再让用户等 */
+      }
+    }
+  }
+
+  printf("[BL] window closed (no 'u') -> boot\r\n");
+}
+
 static void BL_SafeWait(const BL_Meta_t *m, int haveMeta)
 {
   uint32_t half = 0U;
@@ -187,7 +258,7 @@ static void BL_SafeWait(const BL_Meta_t *m, int haveMeta)
 
   printf("\r\n[BL] ===== safe wait mode: no bootable image =====\r\n");
   printf("[BL] LED 1 Hz slow blink on PA1/D2 (HardFault would be a FAST blink).\r\n");
-  printf("[BL] serial commands: ? = help, m = rewrite metadata, r = rescan\r\n");
+  printf("[BL] serial commands: ? = help, u = serial OTA, m = rewrite metadata, r = rescan\r\n");
   printf("[BL] re-checking %s every 1 s; will jump as soon as a valid image shows up.\r\n",
          BL_Slots[want].name);
 
@@ -229,14 +300,71 @@ static void BL_SafeWait(const BL_Meta_t *m, int haveMeta)
  * 顺序：先看元数据指定的槽（active_slot）；它不合法则看**另一个**槽
  * （回滚/降级用得上，S8 会在这里加 boot_attempts 计数）；两个都不行才停。
  *
- * 🔴 故意**不**在这里自作主张改元数据：S3 阶段任何"自动切换"都会让
- *    "到底哪一步改了状态"变得说不清。写元数据的时机只有两个：
- *    自愈（空白片）与 S6/S8 的显式升级流程。 */
-static void BL_BootDecision(int haveMeta, const BL_Meta_t *m)
+ * 🔴 故意**不**在这里自作主张改元数据：任何"自动切换"都会让
+ *    "到底哪一步改了状态"变得说不清。写元数据的时机只有三处：
+ *    自愈（空白片）、S6 的显式升级（置标志）、以及下面的"提交"。
+ */
+
+/* ---------------------------------------------------------------------
+ * 四·一、提交上一次串口升级（S6）
+ * ---------------------------------------------------------------------
+ * 复位后只做一次：`update_pending=1` 且 **Slot B 确实现已可启动** ⇒
+ * 把 `active_slot` 切到 B、清标志、清 boot_attempts，并**重新从 Flash 读回**。
+ *
+ * 🔴 为什么"置标志"和"提交"要分成两次写、中间隔一个复位：
+ *    这样"新镜像写好了"和"下次从哪起"是两个独立的事实，各自在串口上留痕。
+ *    掉电夹在中间也无害 —— 标志已置、镜像已校验，复位后照样提交。
+ * 🔴 为什么 Slot B 不合法时要**清标志**而不是干等：
+ *    否则每次上电都重复报同一句话，而且万一以后有人把 A 也弄坏了，
+ *    就会陷在"标志一直在、B 又不能用"的状态里。清掉即回到已知可用路径。 */
+static int BL_TryCommitUpdate(int haveMeta, const BL_Meta_t *m)
+{
+  BL_Meta_t n;
+  uint32_t  sp = 0U;
+  uint32_t  rv = 0U;
+
+  if ((haveMeta == 0) || (m->update_pending == 0U))
+  {
+    return 0;
+  }
+
+  printf("[BL] update_pending=1 -> verify slot B before install\r\n");
+
+  if (BL_ImageCheck(BL_SLOT_B_ADDR, BL_SLOT_B_SIZE, &sp, &rv) != BL_IMG_OK)
+  {
+    printf("[BL] slot B is NOT bootable -> drop the pending flag, keep %c\r\n",
+           (m->active_slot == (uint8_t)BL_SLOT_ID_B) ? 'B' : 'A');
+    n = *m;
+    n.update_pending = 0U;
+    if (BL_MetaWrite(&n) != 1)
+    {
+      printf("[BL] WARN: could not clear update_pending (will retry next boot)\r\n");
+    }
+    return 0;
+  }
+
+  n = *m;
+  n.active_slot    = (uint8_t)BL_SLOT_ID_B;
+  n.update_pending = 0U;
+  n.boot_attempts  = 0U;
+
+  printf("[BL] install: active_slot %c -> B, update_pending 1 -> 0\r\n",
+         (m->active_slot == (uint8_t)BL_SLOT_ID_B) ? 'B' : 'A');
+
+  if (BL_MetaWrite(&n) != 1)
+  {
+    printf("[BL] install meta write FAILED -> staying on the old slot\r\n");
+    return 0;
+  }
+  return 1;
+}
+
+static void BL_BootDecision(int haveMeta, const BL_Meta_t *m, int justInstalled)
 {
   uint8_t want  = (haveMeta != 0) ? m->active_slot : (uint8_t)BL_SLOT_ID_A;
   uint8_t other;
   uint8_t pass;
+  int     windowDone = 0;
 
   if (want > (uint8_t)BL_SLOT_ID_B)
   {
@@ -244,9 +372,10 @@ static void BL_BootDecision(int haveMeta, const BL_Meta_t *m)
   }
   other = (uint8_t)(want ^ 1U);
 
-  printf("[BL] boot decision: active_slot=%c (metadata %s)\r\n",
+  printf("[BL] boot decision: active_slot=%c (metadata %s)%s\r\n",
          (want == (uint8_t)BL_SLOT_ID_B) ? 'B' : 'A',
-         (haveMeta != 0) ? "valid" : "absent -> assuming A");
+         (haveMeta != 0) ? "valid" : "absent -> assuming A",
+         (justInstalled != 0) ? " [just installed from slot B]" : "");
 
   for (pass = 0U; pass < 2U; pass++)
   {
@@ -265,6 +394,15 @@ static void BL_BootDecision(int haveMeta, const BL_Meta_t *m)
     st = BL_ReportSlot(id, &sp, &rv);
     if (st == BL_IMG_OK)
     {
+      /* 🔴 上电升级窗口：只在"确实有东西可启动"时才开。
+       *    刚提交完升级（justInstalled）那次**跳过** —— 那时候主机
+       *    正在读升级后的日志，不该再把它拽回升级流程。 */
+      if ((windowDone == 0) && (justInstalled == 0))
+      {
+        windowDone = 1;
+        BL_WaitUpdateWindow();
+      }
+
       if (pass == 1U)
       {
         printf("[BL] NOTE: falling back to %s because %s is not bootable\r\n",
@@ -278,9 +416,8 @@ static void BL_BootDecision(int haveMeta, const BL_Meta_t *m)
     }
   }
 
-  printf("[BL] slot A invalid -> stay in bootloader (no jump).\r\n");
-  printf("[BL] 🔴 this is the EXPECTED result at S3: slot A is still blank until S5.\r\n");
-  printf("[BL] 🔴 absence of the App('M1') banner is expected, NOT a failure.\r\n");
+  printf("[BL] neither slot is bootable -> stay in bootloader (no jump).\r\n");
+  printf("[BL] send 'u' within the update window, or press 'u' here, to flash a new image.\r\n");
   BL_SafeWait(m, haveMeta);
 }
 
@@ -291,10 +428,12 @@ void BL_Run(void)
 {
   BL_Meta_t meta;
   int haveMeta;
+  int installed = 0;
 
   BL_PrintBanner();
   (void)BL_FlashMapVerify();     /* 运行期分区表自检（编译期自检看不到"扇区号写错"） */
   (void)BL_CrcSelfTest();        /* 元数据的完整性全靠它，先证明它是对的 */
+  (void)BL_OtaSelfTest();        /* 升级通道的完整性靠帧层 CRC16，同理先证明它是对的 */
 
   /* ---- 元数据：一次扫描定乾坤 ----------------------------------------
    * 🔴 顺序刻意如此：**先扫（只读）→ 打印原始头几字 → 才决定要不要写**。
@@ -325,7 +464,20 @@ void BL_Run(void)
     BL_MetaPrint(&meta, "metadata");
   }
 
-  BL_BootDecision(haveMeta, &meta);
+  /* ---- S6：先把"上一次串口升级"提交掉，再决定跳哪个槽 ------------------
+   * 🔴 顺序不能反：`BL_BootDecision()` 看的是 `meta.active_slot`，
+   *    而提交会改它 ⇒ 提交完**必须重新扫一遍**，否则决策用的是旧值。 */
+  installed = BL_TryCommitUpdate(haveMeta, &meta);
+  if (installed != 0)
+  {
+    haveMeta = BL_MetaScan(&meta);
+    if (haveMeta != 0)
+    {
+      BL_MetaPrint(&meta, "after install");
+    }
+  }
+
+  BL_BootDecision(haveMeta, &meta, installed);
 
   for (;;) { }   /* BL_BootDecision 不返回；这里只是形式上的收尾 */
 }
