@@ -669,13 +669,14 @@ D://STM32Projects//pc-venv//Scripts//python.exe tools\ota_send.py --confirm --po
 > 🔴 **"靠回退到另一槽兜底"只对了一半**（`S7` 实测更正）：只有目标槽**真的不可启动**才会回退；
 > "写了一半但向量表完好"的槽仍会被跳进去（板子静默）⇒ 见 `RUNBOOK.md` **R13.10.6 / R13.12**、`RISKS` **R22**。
 
-#### 12.4 静默 App（`--silent-app`）：`APP_OUTPUT_MODE=2/3` 这类"不说话"的固件
+#### 12.4 静默 App（`--silent-app`）：`APP_OUTPUT_MODE=2/3` 这类"只在开机说一句话"的固件
 
-`mode 2` 的 App **一个字符都不打**（没有横幅、没有 LED 心跳，只有 1 kHz 二进制帧）。
-前 7 条判据看的是 **Bootloader** 的行为，照旧有效；**第 8 条「App 横幅出现」必然 FAIL**
-—— 这不是失败，是判据套错了（和 `--expect-rollback` 那个坑同一类）。
+`mode 2` 的 App **只在开机打一次横幅**（`=== … boot ===` / `mode 2:` / `PWM:` / `[OK] MPU6050`），
+**之后只有 1 kHz 二进制帧**（没有周期性文本、没有 LED 心跳）。前 7 条判据看的是 **Bootloader**
+的行为，照旧有效；第 8 条「App 横幅出现」**其实也能过** —— 但那是一次性证据：横幅在跳转后
+几十毫秒内就打完了，`--tail` 的监听窗口一旦因时序漂移错过它，就会"板子明明好好的却 FAIL"。
 
-`--silent-app` 把第 8 条换成 **「收到 ≥3 个合法二进制帧」**：
+`--silent-app` 把第 8 条换成 **「收到 ≥3 个合法二进制帧」** —— 把**一次性证据**换成**持续性证据**：
 
 ```bash
 D://STM32Projects//pc-venv//Scripts//python.exe tools\ota_send.py \
@@ -683,15 +684,21 @@ D://STM32Projects//pc-venv//Scripts//python.exe tools\ota_send.py \
   --silent-app --stlink-reset
 ```
 
+**实测（2026-10-17，`app_slotB_mode2.bin` / `0x50AEC6FD` / 42 748 B，8/8 全过、退出码 0）**：
+
 ```
-   >> 静默 App：抓到 412 个合法二进制帧（原始字节 79.8 KB）
-  [PASS] App 在跑：收到 412 个合法二进制帧（mode 2 不打文字，改看帧）
+   | [BL] JUMP -> slot B @0x08060000 ... entry=0x080625AD
+   | mode 2: binary frames @1 kHz, 198 bytes/frame          ← 横幅只此一次
+   | [OK] MPU6050 online (WHO_AM_I=0x68), 1kHz sampling starts
+   >> 静默 App：抓到 229 个合法二进制帧（原始字节 48.3 KB）
+  [PASS] App 在跑：收到 229 个合法二进制帧（mode 2 不打文字，改看帧）
 ```
 
 🔴 **数的是"校验正确的帧"，不是 `AA 55` 的个数**：三轴 int16 原始数据里出现 `AA 55` 太便宜，
 拿它当证据随时假阳性。这里复用 `vibframe.FrameParser`（流式 + 自恢复 + 校验和/点数双重把关）。
 🔴 二进制被 `\n` 切出来的乱码行**照样进 `lines`**（判据还要用），只是**不再打到屏幕上** ——
 否则 1 kHz 的流会把 `JUMP -> slot B` 那几行冲走。
+⚠️ **别把这条理解成"mode 2 不打字"** —— 它打，只是只打一次（本文档首版就写错过，2026-10-17 当天更正）。
 ✅ `--selftest` 里有一对**能证伪**的向量：同一段**没有横幅**的合成日志，`silent_app` 传 5 个帧 ⇒ PASS，
 不传 ⇒ FAIL —— 证明这个开关真的改了判定，而不是只改了一行文字。
 ⚠️ `--confirm` 不受影响（`k` 是 Bootloader 的命令，BL 永远打文字）。

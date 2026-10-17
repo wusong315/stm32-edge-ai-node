@@ -477,42 +477,85 @@ static void App_I2cBusRecover(void)
  * 四、上电自检 / 掉线重连
  * ===================================================================== */
 
-/* 探测 MPU6050。硬件没插好时每秒重试一次并在串口打印提示，
- * 方便第一次上板时对着终端排查接线（这是最能省时间的几行代码）。 */
+/* 现在这个时刻**能不能往串口打文字**？
+ *
+ * 🔴 模式 2 一旦开始出帧就绝对不能打。被实测抓到的两个后果：
+ *   ① `[DIAG]` 要扫 0x08~0x77 共 112 个地址（每个 5 ms 超时）——
+ *      电机一转、I2C 偶发一次无应答，它就阻塞主循环约 **1 秒**，
+ *      1 kHz 采样直接丢 **一千拍**；而丢拍在二进制流里**看不出来**
+ *      （固件丢帧不推进 seq，PC 端永远是"序号断档 0 次"）。
+ *   ② 这些文字还会被插进帧流中间，PC 端只能靠重同步丢掉 —— 实测一次
+ *      60 秒录制因此丢了 3 872 个采样点（3.87 秒的假空洞）。
+ *
+ * 上电阶段（还没成功发出过一帧）仍然放开：那时正是最需要看接线提示的时候。 */
+static uint8_t App_TextAllowed(void)
+{
+#if (APP_OUTPUT_MODE == 2)
+  return (g_frame_seq == 0U) ? 1U : 0U;
+#else
+  return 1U;
+#endif
+}
+
+/* 探测 MPU6050。硬件没插好时在串口打印提示，方便第一次上板时对着终端排查接线
+ * （这是最能省时间的几行代码）。
+ *
+ * 🔴 重连节奏用**指数退避**：10 → 20 → 40 → 80 → 160 → 320 → 640 → 1000 拍。
+ *    原来写死"每 1000 拍（=1 秒）重试一次"，实测后果很严重：
+ *    电机一转，I2C 偶发一次无应答 → 固件要**干等满 1 秒**才重试
+ *    ⇒ 一次只要几十毫秒就能恢复的瞬时故障，直接丢掉 ~1000 个采样点（31 帧）。
+ *    60 秒录制里发生 4 次 = 3 872 点凭空消失，且数据流毫无痕迹。
+ *    退避让"抖一下就回来"，同时仍不会对真正坏死的总线按 1 kHz 高频硬刚
+ *    （那样每次 5 ms 超时会把采样彻底拖死）。 */
 static void App_EnsureSensor(void)
 {
   static uint8_t  s_first     = 1U;
   static uint8_t  s_diag_done = 0U;   /* 总线体检只打一次，避免每秒刷屏 */
   static uint32_t s_last      = 0U;
+  static uint32_t s_backoff   = 0U;   /* 下一次重试要等几拍（0 = 首次） */
+  uint32_t wait;
   mpu6050_status_t st;
 
   if (g_sensor_ok != 0U)
   {
     return;
   }
-  /* 首次立即探测；之后每 1000 拍（=1 秒）重试一次 */
-  if ((s_first == 0U) && ((uint32_t)(g_tick - s_last) < 1000U))
+  /* 首次立即探测；之后按退避间隔重试 */
+  wait = (s_backoff == 0U) ? 10U : s_backoff;
+  if ((s_first == 0U) && ((uint32_t)(g_tick - s_last) < wait))
   {
     return;
   }
   s_first = 0U;
   s_last  = g_tick;
+  s_backoff = (wait >= 500U) ? 1000U : (wait * 2U);
+  if (s_backoff > 1000U)
+  {
+    s_backoff = 1000U;
+  }
 
   st = MPU6050_Init(&hi2c1);
   if (st == MPU6050_OK)
   {
     g_sensor_ok = 1U;
     s_diag_done = 0U;   /* 掉线后再次失败时，体检要能重跑 */
-    printf("[OK] MPU6050 online (WHO_AM_I=0x68), 1kHz sampling starts\r\n");
+    s_backoff   = 0U;   /* 恢复正常，下次掉线仍然快速重试 */
+    if (App_TextAllowed() != 0U)
+    {
+      printf("[OK] MPU6050 online (WHO_AM_I=0x68), 1kHz sampling starts\r\n");
+    }
   }
   else
   {
-    uint8_t id = 0U;
-    (void)MPU6050_WhoAmI(&hi2c1, &id);   /* 顺便把实际读到的 id 打出来 */
-    printf("[WAIT] MPU6050 not found (id=0x%02X). Check wiring: "
-           "VCC=3V3 GND SDA=PB7 SCL=PB6 AD0=GND\r\n", (unsigned)id);
+    if (App_TextAllowed() != 0U)
+    {
+      uint8_t id = 0U;
+      (void)MPU6050_WhoAmI(&hi2c1, &id);   /* 顺便把实际读到的 id 打出来 */
+      printf("[WAIT] MPU6050 not found (id=0x%02X). Check wiring: "
+             "VCC=3V3 GND SDA=PB7 SCL=PB6 AD0=GND\r\n", (unsigned)id);
+    }
 
-    if (s_diag_done == 0U)
+    if ((s_diag_done == 0U) && (App_TextAllowed() != 0U))
     {
       s_diag_done = 1U;
       App_I2cDiag();   /* 首次失败才体检：一次给出定因，不是每秒刷屏 */
@@ -649,6 +692,16 @@ static void App_OnTick(void)
     if (MPU6050_ReadAccel(&raw) != MPU6050_OK)
     {
       g_sensor_ok = 0U;
+      /* 🔴 必须把已经攒了一半的帧**作废**。
+       *    不作废的话，等传感器重连回来会接着往同一帧里塞：
+       *    这一帧的 32 个点就**跨过一个真实空洞首尾相接**，而校验和、
+       *    序号、物理量全部合法 ⇒ 数据看着完好，其实是一段假波形。
+       *    这种错误无法在下游被发现，宁可少一帧（下游只是少一个窗口）。 */
+      if (g_frame_idx > 0U)
+      {
+        g_frame_idx = 0U;
+        g_frame_dropped++;
+      }
       return;
     }
     g_frame_ax[g_frame_idx] = raw.ax;
