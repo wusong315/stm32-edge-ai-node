@@ -21,7 +21,9 @@ typedef enum
   BL_IMG_OK = 0,      /* 可以跳 */
   BL_IMG_BLANK,       /* 首字 = 0xFFFFFFFF：这一槽还没编程 */
   BL_IMG_BAD_SP,      /* 初始栈顶不在 RAM 范围 / 未对齐 */
-  BL_IMG_BAD_RV       /* 复位向量不是奇数（无 Thumb 位）或不在本槽区间 */
+  BL_IMG_BAD_RV,      /* 复位向量不是奇数（无 Thumb 位）或不在本槽区间 */
+  BL_IMG_BAD_CRC      /* 🔴 S8：镜像级 CRC32 与元数据里声明的值不符
+                       *    = "写了一半 / 内容坏了但向量表完好" —— 只有它能拦住 */
 } BL_ImgStatus;
 
 /**
@@ -36,8 +38,32 @@ typedef enum
   *            直接跳过去会立刻 HardFault，而且**看不出是 Bootloader 的错**；
   *         🔴 "复位向量是奇数" —— Cortex-M 的向量最低位必须是 1（Thumb 态），
   *            偶数说明这不是一个合法向量表；F4 的硬件在跳转时**不会替你检查**。
+  *         ⚠️ 这三条**只读头 8 字节** ⇒ 拦不住"写了一半但向量表完好"的槽。
+  *            要拦那种必须用 BL_ImageCheckCrc()。
   */
 BL_ImgStatus BL_ImageCheck(uint32_t addr, uint32_t size, uint32_t *sp, uint32_t *rv);
+
+/**
+  * @brief  在 BL_ImageCheck() 之上再加一道**镜像级 CRC32**（S8）。
+  * @param  dCrc 元数据里声明的整镜像 CRC32（= `zlib.crc32`）
+  * @param  dLen 元数据里声明的镜像长度；**0 = 没有描述子** ⇒ 退回仅头校验
+  * @param  verbose 1 = 把判据细节（算出来的 CRC / 声明值 / 退回仅头校验）
+  *                 打印出来；0 = 只返回结果、一个字不打印
+  * @retval BL_IMG_OK / BL_IMG_BAD_CRC（头 8 字节那几种原因照样原样透出）
+  * @note   🔴 这就是"写 → 读回 → 校验"纪律在镜像级的落点，也是本工程
+  *         唯一能拦住下面这个场景的手段：
+  *           OTA 只写了前 20 帧就被判失败 ⇒ 槽里是半截镜像，但**向量表完好**
+  *           ⇒ BL_ImageCheck() 判 valid ⇒ 跳进去 ⇒ App 跑飞、板子静默。
+  *         ⚠️ 代价是**要读回整段镜像**（本工程镜像 ≈ 41.8 KB）：
+  *           位运算版 CRC32 在 168 MHz 上约 8 次移位/字节 ⇒ 约 4 ms。
+  *           只在**跳之前**做一次，完全可接受；换来的是"绝不跳进坏槽"。
+  *         ⚠️ `dLen > size` 视为描述子不可信 ⇒ 同样报 BAD_CRC（宁可拒收）。
+  *         ⚠️ `verbose = 0` 是给"安全等待里每秒轮询一次"用的 —— 那种地方
+  *           一秒钟印一行会把串口刷满，而状态没变时重复的话没有信息量。
+  */
+BL_ImgStatus BL_ImageCheckCrc(uint32_t addr, uint32_t size,
+                              uint32_t dCrc, uint32_t dLen,
+                              uint32_t *sp, uint32_t *rv, int verbose);
 
 /** @brief 把 BL_ImgStatus 变成一句人能读的话。 */
 const char *BL_ImgStatusStr(BL_ImgStatus st);

@@ -3,7 +3,7 @@
   * @file    bl_boot.c
   * @brief   Bootloader 主流程。
   *
- * @note    🔴 施工阶段（推演稿 §7）：**本文件当前到 S7 的范围**。
+ * @note    🔴 施工阶段（推演稿 §7）：**本文件当前到 S8 的范围**。
  *
  *          S3 = "读元数据 → 校验镜像 → 合法才跳 / 不合法就留在原地"。
  *          ✅ S5 已真机闭环（把 Slot A 版 App 烧到 `0x0800C000`，跳过去运行正常）。
@@ -11,6 +11,20 @@
  *               协议与实现都在 `bl_ota.c`；本文件只负责**编排**：
  *               ① 上电留一段升级窗口（否则 Slot A 合法就秒跳，PC 没机会插进来）；
  *               ② 复位后若发现 `update_pending=1`，先"提交"再决定跳哪个槽。
+ *          ✅ S7 已真机闭环（坏包拒收；并修掉"窗口之后沿用陈旧判断"那个跳转缺陷）。
+ *          S8 = "回滚"：两件事
+ *               ① **镜像级 CRC32 判据** —— `BL_ImageCheck()` 只看头 8 字节，
+ *                  拦不住"写了一半但向量表完好"的槽（S7 实测被它坑到板子静默）。
+ *                  现在把 OTA 结束时声明并读回验过的 CRC32 记进元数据
+ *                  （`BL_ImgDesc_t`），跳之前**读回整段重算**再决定 —— 闭合 RISKS R22。
+ *               ② **试运行计数回滚** —— `commit` 时把新槽标成 `trial=1`；
+ *                  之后每次复位进这个槽就 `boot_attempts++`；一旦超过
+ *                  `max_boot_attempts` 就**自动切回旧槽**（"启动即崩"的固件
+ *                  会不断复位 ⇒ 计数器必然爬满 ⇒ 必然回滚）。
+ *                  确认方式（本步）= 串口命令 `k`（清 trial + 计数器）。
+ *                  ⚠️ 遗留（有意）：**App 自己起来后自动确认**这一环还没做 ⇒
+ *                     正常跑着的新固件若被人工断电 `max_boot_attempts` 次，
+ *                     会被误判成"起不来"而回滚。发 `k` 即可消除该状态。
  *
  *          🔴 S3 时期与推演稿原文的差别（重要，见 `RUNBOOK.md` R13.3）：
  *          原稿写"只跳 0x08000000（即现在的 App）"，且判据是"串口仍打 M1 横幅"。
@@ -19,10 +33,12 @@
  *          ⇒ 判据改到"**不跳**"这一侧：Slot A 此刻还是空白，所以正确的现象是
  *            **明确打印 invalid 并停住**，而板上不再有 M1 横幅是**预期**。
  *
- *          🔴 写元数据的时机现在有**三个**，别再多加：
+ *          🔴 写元数据的时机现在有**五处**，别再多加：
  *            ① 自愈（空白片）；② S6 的"置标志"（`bl_ota.c`）；
- *            ③ S6 的"提交"（本文件 `BL_TryCommitUpdate()`，复位后只跑一次）。
- *            任何"自动切换"都必须落在这三处，否则"到底哪一步改了状态"就说不清了。
+ *            ③ S6 的"提交"（本文件 `BL_TryCommitUpdate()`，复位后只跑一次）；
+ *            ④ S8 的"试运行计数 / 回滚"（本文件 `BL_HandleTrial()`）；
+ *            ⑤ S8 的"串口确认"（本文件 `BL_HandleCmd()` 的 `k`）。
+ *            任何"自动切换"都必须落在这五处，否则"到底哪一步改了状态"就说不清了。
  ******************************************************************************
  */
 #include "main.h"
@@ -45,7 +61,7 @@ extern UART_HandleTypeDef huart1;
  * 🔴 以后排查"到底烧进去的是哪一版"时，这一行是唯一可信的锚：
  *    别靠文件时间戳，那玩意儿在复制/解压时会变。 */
 #define BL_VERSION_MAJOR    (0U)
-#define BL_VERSION_MINOR    (5U)    /* S3 元数据+校验+跳转；S5 真机闭环；S6 串口升级；S7 坏包拒收（修"窗口后沿用陈旧判断"的跳转缺陷） */
+#define BL_VERSION_MINOR    (6U)    /* S3 元数据+校验+跳转；S5 真机闭环；S6 串口升级；S7 坏包拒收；S8 镜像级判据 + 试运行计数回滚 */
 
 /* =====================================================================
  * 槽表 —— 一处定义，后面只按 id 取
@@ -66,6 +82,8 @@ static const BL_Slot_t BL_Slots[2] =
 static void BL_SafeWait(const BL_Meta_t *m, int haveMeta);
 static void BL_HandleCmd(uint8_t ch);
 static void BL_WaitUpdateWindow(void);
+static int  BL_HandleTrial(const BL_Meta_t *m);
+static void BL_BootDecision(int haveMeta, const BL_Meta_t *m, int justInstalled);
 
 /* =====================================================================
  * 一、横幅
@@ -73,7 +91,7 @@ static void BL_WaitUpdateWindow(void);
 static void BL_PrintBanner(void)
 {
   printf("\r\n\r\n");
-  printf("=== stm32-ota-bootloader v%u.%u (S7: serial OTA + bad-frame reject) ===\r\n",
+  printf("=== stm32-ota-bootloader v%u.%u (S8: image-level CRC32 + rollback) ===\r\n",
          (unsigned)BL_VERSION_MAJOR, (unsigned)BL_VERSION_MINOR);
   /* 构建时间戳同样有用：OTA 只会替换 App，Bootloader 是长期不动的，
    * 这一行能立刻回答"现在板上跑的是哪次编的 Bootloader"。 */
@@ -104,13 +122,28 @@ static void BL_PrintBanner(void)
 
 /* =====================================================================
  * 二、槽探测（**只读**，无副作用）
- * ===================================================================== */
-static BL_ImgStatus BL_ReportSlot(uint8_t id, uint32_t *spOut, uint32_t *rvOut)
+ * =====================================================================
+ * 🔴 S8 起改成走 `BL_ImageCheckCrc()`：除了头 8 字节，还要拿元数据里的
+ *    **镜像描述子**（`img[id]`）读回整段重算 CRC32。`m == NULL` 或
+ *    `m->img[id].len == 0` 时退回仅头校验，并由 `bl_jump.c` 明说一句
+ *    "no crc32 descriptor" —— 让"为什么这个槽没被拦"在串口上可查。 */
+static BL_ImgStatus BL_ReportSlot(uint8_t id, const BL_Meta_t *m,
+                                  uint32_t *spOut, uint32_t *rvOut)
 {
   const BL_Slot_t *s = &BL_Slots[id];
   uint32_t sp = 0U;
   uint32_t rv = 0U;
-  BL_ImgStatus st = BL_ImageCheck(s->addr, s->size, &sp, &rv);
+  uint32_t dCrc = 0U;
+  uint32_t dLen = 0U;
+  BL_ImgStatus st;
+
+  if (m != NULL)
+  {
+    dCrc = m->img[id].crc32;
+    dLen = m->img[id].len;
+  }
+
+  st = BL_ImageCheckCrc(s->addr, s->size, dCrc, dLen, &sp, &rv, 1);
 
   printf("[BL] %s @0x%08lX (%lu KB): first=0x%08lX reset=0x%08lX -> %s\r\n",
          s->name, (unsigned long)s->addr, (unsigned long)(s->size / 1024UL),
@@ -138,10 +171,46 @@ static void BL_HandleCmd(uint8_t ch)
   {
     case '?':
       printf("[BL] commands: u = enter serial update mode (S6)\r\n");
+      printf("[BL]           k = confirm the trial image (clear trial + boot_attempts)\r\n");
       printf("[BL]           m = rewrite metadata (readback verified)\r\n");
       printf("[BL]           r = rescan metadata + both slots\r\n");
       printf("[BL]           ? = this help\r\n");
       break;
+
+    /* 🔴 S8 的"确认"入口。`trial=1` 的槽**每次复位进来**都会让
+     *    `boot_attempts` 加一，超过 `max_boot_attempts` 就自动回滚。
+     *    新固件跑起来看着没问题，就发一个 `k` 把 trial 与计数器归零 ——
+     *    否则日后正常的人工断电也会被算成"试启动失败"，白白回滚。
+     *    ⚠️ 将来的正式做法是 **App 起来后自己回来确认**（本步有意没做，
+     *       理由见 `DECISIONS.md` D30：动 App 工程要改三个构建配置）。 */
+    case 'k':
+    case 'K':
+    {
+      BL_Meta_t n;
+      int have = BL_MetaScan(&n);
+
+      if (have == 0)
+      {
+        printf("[BL] k: no valid metadata -> nothing to confirm\r\n");
+      }
+      else if ((n.trial == 0U) && (n.boot_attempts == 0U))
+      {
+        printf("[BL] k: already confirmed (trial=0, boot_attempts=0)\r\n");
+      }
+      else
+      {
+        printf("[BL] k: confirming slot %c (trial %u->0, boot_attempts %u->0)\r\n",
+               (n.active_slot == (uint8_t)BL_SLOT_ID_B) ? 'B' : 'A',
+               (unsigned)n.trial, (unsigned)n.boot_attempts);
+        n.trial         = 0U;
+        n.boot_attempts = 0U;
+        if (BL_MetaWrite(&n) != 1)
+        {
+          printf("[BL] k: confirm write FAILED -> still unconfirmed\r\n");
+        }
+      }
+      break;
+    }
 
     /* 🔴 升级入口。`BL_OtaRun()` 返回 1 = 镜像已写进 Slot B 且校验通过、
      *    `update_pending` 已置位 ⇒ **必须复位**，让启动流程去"提交"。
@@ -186,13 +255,13 @@ static void BL_HandleCmd(uint8_t ch)
     case 'r':
     {
       int have = BL_MetaScan(&cur);
-      BL_MetaPrintRaw();
+      (void)BL_MetaPrintRaw();
       if (have != 0)
       {
         BL_MetaPrint(&cur, "meta");
       }
-      (void)BL_ReportSlot(BL_SLOT_ID_A, NULL, NULL);
-      (void)BL_ReportSlot(BL_SLOT_ID_B, NULL, NULL);
+      (void)BL_ReportSlot(BL_SLOT_ID_A, &cur, NULL, NULL);
+      (void)BL_ReportSlot(BL_SLOT_ID_B, &cur, NULL, NULL);
       break;
     }
 
@@ -250,6 +319,10 @@ static void BL_SafeWait(const BL_Meta_t *m, int haveMeta)
 {
   uint32_t half = 0U;
   uint8_t  want = (haveMeta != 0) ? m->active_slot : (uint8_t)BL_SLOT_ID_A;
+  /* 🔴 S8：安全等待里也要用**镜像级**判据 —— 否则"半截镜像"在这条路径上
+   *    照样会被当成"变合法了"而跳走（S7 实测过的坑，只是入口不同）。 */
+  const BL_Meta_t *mp = (haveMeta != 0) ? m : NULL;
+  BL_ImgStatus lastSt = BL_IMG_BLANK;   /* 只在状态变化时打印，免得每秒刷一行 */
 
   if (want > (uint8_t)BL_SLOT_ID_B)
   {
@@ -258,8 +331,8 @@ static void BL_SafeWait(const BL_Meta_t *m, int haveMeta)
 
   printf("\r\n[BL] ===== safe wait mode: no bootable image =====\r\n");
   printf("[BL] LED 1 Hz slow blink on PA1/D2 (HardFault would be a FAST blink).\r\n");
-  printf("[BL] serial commands: ? = help, u = serial OTA, m = rewrite metadata, r = rescan\r\n");
-  printf("[BL] re-checking %s every 1 s; will jump as soon as a valid image shows up.\r\n",
+  printf("[BL] serial commands: ? = help, u = serial OTA, k = confirm, m = rewrite meta, r = rescan\r\n");
+  printf("[BL] re-checking %s every 1 s (header + crc32); will jump as soon as it is valid.\r\n",
          BL_Slots[want].name);
 
   for (;;)
@@ -285,7 +358,27 @@ static void BL_SafeWait(const BL_Meta_t *m, int haveMeta)
     {
       uint32_t sp = 0U;
       uint32_t rv = 0U;
-      if (BL_ImageCheck(BL_Slots[want].addr, BL_Slots[want].size, &sp, &rv) == BL_IMG_OK)
+      uint32_t dCrc = 0U;
+      uint32_t dLen = 0U;
+      BL_ImgStatus st;
+
+      if (mp != NULL)
+      {
+        dCrc = mp->img[want].crc32;
+        dLen = mp->img[want].len;
+      }
+
+      /* verbose = 0：轮询不打印细节，由下面这行"状态变了才说"接管。 */
+      st = BL_ImageCheckCrc(BL_Slots[want].addr, BL_Slots[want].size,
+                            dCrc, dLen, &sp, &rv, 0);
+
+      if (st != lastSt)
+      {
+        printf("[BL] %s recheck -> %s\r\n", BL_Slots[want].name, BL_ImgStatusStr(st));
+        lastSt = st;
+      }
+
+      if (st == BL_IMG_OK)
       {
         printf("[BL] %s became valid while waiting -> jumping\r\n", BL_Slots[want].name);
         BL_JumpToApp(BL_Slots[want].addr, sp, rv);
@@ -330,7 +423,12 @@ static int BL_TryCommitUpdate(int haveMeta, const BL_Meta_t *m)
 
   printf("[BL] update_pending=1 -> verify slot B before install\r\n");
 
-  if (BL_ImageCheck(BL_SLOT_B_ADDR, BL_SLOT_B_SIZE, &sp, &rv) != BL_IMG_OK)
+  /* 🔴 S8：这里的判据从"头 8 字节"升级成**头 8 字节 + 整镜像 CRC32**。
+   *    理由：提交意味着"从此以后从 B 启动"，是**最不能错的一步**；
+   *    而 B 刚被擦过、重写过，恰恰是最可能出现"半截镜像"的地方。 */
+  if (BL_ImageCheckCrc(BL_SLOT_B_ADDR, BL_SLOT_B_SIZE,
+                       m->img[BL_SLOT_ID_B].crc32, m->img[BL_SLOT_ID_B].len,
+                       &sp, &rv, 1) != BL_IMG_OK)
   {
     printf("[BL] slot B is NOT bootable -> drop the pending flag, keep %c\r\n",
            (m->active_slot == (uint8_t)BL_SLOT_ID_B) ? 'B' : 'A');
@@ -347,13 +445,89 @@ static int BL_TryCommitUpdate(int haveMeta, const BL_Meta_t *m)
   n.active_slot    = (uint8_t)BL_SLOT_ID_B;
   n.update_pending = 0U;
   n.boot_attempts  = 0U;
+  /* 🔴 S8：新装的槽一律先当"试运行"—— 接下来每次复位进来都会累加
+   *    `boot_attempts`，爬满 `max_boot_attempts` 就自动切回旧槽。
+   *    用串口 `k` 确认（或将来由 App 自己确认）才解除。 */
+  n.trial          = 1U;
 
-  printf("[BL] install: active_slot %c -> B, update_pending 1 -> 0\r\n",
+  printf("[BL] install: active_slot %c -> B, update_pending 1 -> 0, trial=1\r\n",
          (m->active_slot == (uint8_t)BL_SLOT_ID_B) ? 'B' : 'A');
 
   if (BL_MetaWrite(&n) != 1)
   {
     printf("[BL] install meta write FAILED -> staying on the old slot\r\n");
+    return 0;
+  }
+  return 1;
+}
+
+/* ---------------------------------------------------------------------
+ * 四·二、试运行计数与回滚（S8）
+ * ---------------------------------------------------------------------
+ * 调用时机：**提交之后、启动决策之前** —— 必须在决策之前，因为回滚会改
+ * `active_slot`，而决策读的就是它。
+ *
+ * 🔴 为什么"计数 = 复位次数"这件事就够用，不需要 App 主动上报心跳：
+ *    一个能正常跑的新固件**不会自己复位**；而"启动即崩"的固件会不断复位
+ *    ⇒ 计数器必然爬满 ⇒ 必然回滚。
+ *    反过来，健康设备一直跑着，计数器停在 1 ⇒ **永远不会误回滚**。
+ *    这就是"零 App 改动也能做回滚"的全部理由。
+ * ⚠️ 代价（有意保留，理由见文件头）：**确认之前人手断电** `max_boot_attempts`
+ *    次，会被当成"起不来"而回滚。发一个串口 `k` 即解除该状态；
+ *    正式做法是 App 起来后自己确认（本步没做，见 `DECISIONS.md` D30）。
+ * 🔴 回滚**只改 `active_slot`，不擦任何 Flash** —— 旧槽的原样内容还在，
+ *    这正是"回滚"能成立的物理原因。
+ *
+ * @retval 1 = 元数据已被改并写盘（调用方需重新扫描后再决策）；0 = 没动
+ */
+static int BL_HandleTrial(const BL_Meta_t *m)
+{
+  BL_Meta_t n;
+  uint8_t   other;
+
+  if ((m == NULL) || (m->trial == 0U))
+  {
+    return 0;
+  }
+
+  other = (uint8_t)(m->active_slot ^ 1U);
+  if (other > (uint8_t)BL_SLOT_ID_B)
+  {
+    other = (uint8_t)BL_SLOT_ID_A;      /* 字段被写坏时的兜底 */
+  }
+
+  n = *m;
+
+  if (m->boot_attempts >= m->max_boot_attempts)
+  {
+    printf("[BL] trial failed %u/%u (app_version %lu) -> ROLLBACK slot %c -> %c\r\n",
+           (unsigned)m->boot_attempts, (unsigned)m->max_boot_attempts,
+           (unsigned long)m->app_version,
+           (m->active_slot == (uint8_t)BL_SLOT_ID_B) ? 'B' : 'A',
+           (other == (uint8_t)BL_SLOT_ID_B) ? 'B' : 'A');
+
+    n.active_slot   = other;
+    n.trial         = 0U;
+    n.boot_attempts = 0U;
+
+    if (BL_MetaWrite(&n) != 1)
+    {
+      printf("[BL] ROLLBACK meta write FAILED -> will retry next boot\r\n");
+      return 0;
+    }
+    printf("[BL] ROLLBACK recorded; booting slot %c instead\r\n",
+           (other == (uint8_t)BL_SLOT_ID_B) ? 'B' : 'A');
+    return 1;
+  }
+
+  n.boot_attempts = (uint8_t)(m->boot_attempts + 1U);
+  printf("[BL] trial boot %u/%u on slot %c -- unconfirmed, send 'k' to confirm\r\n",
+         (unsigned)n.boot_attempts, (unsigned)m->max_boot_attempts,
+         (m->active_slot == (uint8_t)BL_SLOT_ID_B) ? 'B' : 'A');
+
+  if (BL_MetaWrite(&n) != 1)
+  {
+    printf("[BL] WARN: could not persist boot_attempts (rollback may be delayed)\r\n");
     return 0;
   }
   return 1;
@@ -391,7 +565,7 @@ static void BL_BootDecision(int haveMeta, const BL_Meta_t *m, int justInstalled)
       break;
     }
 
-    st = BL_ReportSlot(id, &sp, &rv);
+    st = BL_ReportSlot(id, m, &sp, &rv);
     if (st == BL_IMG_OK)
     {
       /* 🔴 上电升级窗口：只在"确实有东西可启动"时才开。
@@ -423,7 +597,7 @@ static void BL_BootDecision(int haveMeta, const BL_Meta_t *m, int justInstalled)
          *    Reset 向量），所以"擦了一半、但向量表完好"的槽**仍会被判成合法**。
          *    要根治必须让启动决策能校验**整镜像**（把声明的 CRC32 记进元数据、
          *    启动时读回重算），那是 `S8` 回滚判据的一部分。 */
-        st = BL_ReportSlot(id, &sp, &rv);
+        st = BL_ReportSlot(id, m, &sp, &rv);
         if (st != BL_IMG_OK)
         {
           printf("[BL] %s became INVALID during the update window -> NOT jumping\r\n",
@@ -503,6 +677,19 @@ void BL_Run(void)
     if (haveMeta != 0)
     {
       BL_MetaPrint(&meta, "after install");
+    }
+  }
+
+  /* ---- S8：试运行计数 / 回滚 ------------------------------------------
+   * 🔴 必须夹在"提交"与"决策"之间：提交把它标成 `trial=1`，这里决定
+   *    "这次还试不试得起"，**回滚会改 `active_slot`** —— 所以它跑完之后
+   *    一定要重扫，否则决策会拿着刚被自己改掉的旧值去跳。 */
+  if (BL_HandleTrial((haveMeta != 0) ? &meta : NULL) != 0)
+  {
+    haveMeta = BL_MetaScan(&meta);
+    if (haveMeta != 0)
+    {
+      BL_MetaPrint(&meta, "after trial");
     }
   }
 

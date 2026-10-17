@@ -30,11 +30,34 @@ extern "C" {
  * 0x544F4F42 小端存储后的字节序列是 'B' 'O' 'O' 'T' ——
  * 用十六进制 dump 看参数区时一眼就能认出"这是元数据，不是残留的 App 机器码"。 */
 #define BL_META_MAGIC           (0x544F4F42UL)
-#define BL_META_STRUCT_VERSION  (1U)
+/* 🔴 版本 2 = `S8`（回滚）：从 `reserved[64]` 里划出 `img[2]`（镜像描述子）与
+ *    `trial`。**总大小仍是 128 B、crc32 仍落在 @124**，所以下面那两条
+ *    `_Static_assert` 依旧成立 —— 这是"加字段不动布局"的做法。
+ *    ⚠️ 版本号一变，**旧固件写的记录就不再被认**（`BL_MetaRecIsValid` 会拒），
+ *       于是首次上电会走自愈 → 出厂默认（`active_slot = A`）。这是**有意**的：
+ *       与其冒险按新布局去解释旧字节，不如退到"已知可用"的 Slot A。 */
+#define BL_META_STRUCT_VERSION  (2U)
 
 /* 槽标识 */
 #define BL_SLOT_ID_A            (0U)
 #define BL_SLOT_ID_B            (1U)
+
+/**
+  * @brief  「已校验镜像」描述子（`S8` 新增）。
+  * @note   🔴 这是本工程"写 → 读回 → 校验"纪律在**镜像级**的落点。
+  *         为什么必须有它：`BL_ImageCheck()` 只读镜像**头 8 字节**
+  *         （初始 MSP + Reset 向量），所以"擦了一半 / 只写了前 20 帧、
+  *         但向量表完好"的槽**仍然会被判成合法** ⇒ Bootloader 照样跳进去
+  *         ⇒ App 立刻跑飞、板子静默（2026-10-16 `S7` 实测量到：3 s 收 0 字节）。
+  *         有了描述子，启动决策就能把**整段镜像读回来重算 CRC32**，与
+  *         当初 OTA 结束时"读回校验通过"的那个值比对。
+  *         `len == 0` 表示"这一槽没有描述子"（例如用 ST-Link 直接烧的
+  *         Slot A）⇒ 退回仅头校验，并**在串口上明说退回了**，不含糊过去。 */
+typedef struct
+{
+  uint32_t crc32;             /* 整段镜像的 CRC32（= zlib.crc32）        */
+  uint32_t len;               /* 镜像字节数；0 = 无描述子                 */
+} BL_ImgDesc_t;
 
 /**
   * @brief  一条元数据记录（= 参数区里的一条日志）。
@@ -57,7 +80,9 @@ typedef struct
   uint32_t neai_model_ver;    /* @ 20  片上再训练的模型版本（推演稿 §11.3）*/
   float    calib_k[3];        /* @ 24  6 姿态静态标定的增益 k（3 轴）      */
   float    calib_b[3];        /* @ 36  6 姿态静态标定的零偏 b（3 轴）      */
-  uint8_t  reserved[64];      /* @ 48  推演稿 §11.3 要求的预留区（64 B）   */
+  BL_ImgDesc_t img[2];        /* @ 48  每槽「已校验镜像」描述子（S8）       */
+  uint8_t  trial;             /* @ 64  1 = 当前 active 槽是"试运行"、还没确认 */
+  uint8_t  reserved[47];      /* @ 65  推演稿 §11.3 预留区（从 64 B 缩到 47 B）*/
   uint8_t  pad[12];           /* @112  对齐垫：把 crc32 顶到记录最后一字   */
   uint32_t crc32;             /* @124  CRC32，覆盖 [0,124)              */
 } BL_Meta_t;

@@ -163,6 +163,18 @@ class Dev(object):
                     return ln
         return None
 
+    def wait_any(self, needles, timeout):
+        """等**任一个** needle 出现，返回命中的那一行（不知道是哪个就看内容）。"""
+        self.mark()
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            self._pump()
+            for ln in self.new_lines():
+                for nd in needles:
+                    if nd in ln:
+                        return ln
+        return None
+
     def drain(self, seconds):
         t0 = time.time()
         while time.time() - t0 < seconds:
@@ -183,15 +195,15 @@ def pick_port():
     raise SystemExit("自动找串口失败（候选：%s），请用 --port 指定" % cand)
 
 
-def evaluate(lines, corrupt):
-    """机器判据（不靠肉眼看）。`--corrupt` 模式判「S7 坏包拒收」，否则判「S6 升级成功」。
+def evaluate(lines, corrupt, expect_rollback=False):
+    """机器判据（不靠肉眼看）。三套：`--corrupt` 判坏包拒收 / `--expect-rollback` 判回滚 / 否则判升级成功。
 
     ⚠️ **失败路径上也要调用它** —— S7 想看的恰恰是"该失败的地方失败了"，
        不打印就等于白跑一趟（2026-10-16 第一版就踩了这个：坏帧路线提前 `return 2`，
        判据块根本没打印）。返回 True = 全部通过。
     """
     if corrupt is not None:
-        title = "S7 判据（坏包拒收 / 重传 / 中止 / 不置标志）"
+        title = "S7/S8 判据（坏包拒收 / 重传 / 中止 / 不置标志 / 不跳坏槽）"
         checks = [
             ("设备对坏帧回了 NAK（帧层 CRC16 真的在工作）",
              "crc16 FAIL" in lines and "-> NAK" in lines),
@@ -203,14 +215,51 @@ def evaluate(lines, corrupt):
             ("没有跳进那个刚被判坏的槽（没有 JUMP -> slot B）",
              "JUMP -> slot B" not in lines),
         ]
+        # 🔴 上面五条 `S7` 就有了。下面这两条是 `S8` 新增的**关键区别**：
+        #    坏在第 0 帧 ⇒ Slot B 被擦成空白 ⇒ 头 8 字节就判 BLANK（旧路径够用）；
+        #    坏在中间帧 ⇒ Slot B 半截但**向量表完好** ⇒ 只有 S8 的**镜像级
+        #    CRC32** 能抓住它。两者是**不同的现象**，判据也必须分开写 ——
+        #    否则"坏在第 20 帧"和"什么都没测到"在输出上是同一个样子。
+        if corrupt == 0:
+            checks.append((
+                "Slot B 被擦成空白 -> 明确判不合法、不跳（S7 路径）",
+                "became INVALID during the update window" in lines))
+        else:
+            checks.append((
+                "半截镜像被镜像级 CRC32 抓住（S8 新增判据）",
+                "image crc32 MISMATCH" in lines))
+            checks.append((
+                "最终回退跳到 Slot A、板子没静默（S8 新增判据）",
+                "JUMP -> slot A" in lines))
+    elif expect_rollback:
+        # 🔴 砖镜像**没有 App 横幅**，所以不能套用"升级成功"那一套（第 8 条必然 FAIL）——
+        #    那不是缺陷，是**判据套错了**。回滚路线要看的是"计数涨到顶、指针被改回 A"。
+        title = "S8 判据（砖镜像试运行 -> 试运行计数 -> 自动回滚到 Slot A）"
+        checks = [
+            ("读完回 CRC32 与声明值一致", "[OTA] readback crc32" in lines and "MATCH" in lines),
+            ("元数据里记下了 Slot B 的镜像描述子（S8）", "img B desc" in lines),
+            ("提交后进入试运行（install + trial=1）",
+             "trial=1" in lines and "install: active_slot" in lines),
+            ("试运行计数真的在涨（trial boot 1/3）", "trial boot 1/3" in lines),
+            ("计数到顶触发回滚（trial failed N/N -> ROLLBACK slot B -> A）",
+             "trial failed" in lines and "ROLLBACK slot B -> A" in lines),
+            ("回滚只改指针：下一行从 A 启动（ROLLBACK recorded -> booting slot A）",
+             "ROLLBACK recorded; booting slot A instead" in lines),
+            ("回滚后真的跳到 Slot A（板子没静默）", "JUMP -> slot A" in lines),
+        ]
     else:
-        title = "S6 判据"
+        title = "S6/S8 判据（升级成功 + 描述子落盘 + 试运行计数）"
         checks = [
             ("读完回 CRC32 与声明值一致", "[OTA] readback crc32" in lines and "MATCH" in lines),
             ("已置 update_pending=1",     "[OTA] staged: update_pending=1" in lines),
+            ("元数据里记下了 Slot B 的镜像描述子（S8）",
+             "img B desc" in lines),
             ("复位后走到提交步骤",         "update_pending=1 -> verify slot B" in lines),
-            ("active_slot 切到 B",         "install: active_slot A -> B" in lines
-                                          or "install: active_slot B -> B" in lines),
+            ("提交前用**镜像级 CRC32** 复验了 Slot B（S8）",
+             "image crc32 OK" in lines),
+            ("active_slot 切到 B 且标成试运行", "trial=1" in lines
+                                          and ("install: active_slot A -> B" in lines
+                                               or "install: active_slot B -> B" in lines)),
             ("真的跳到 Slot B",            "JUMP -> slot B" in lines),
             ("App 横幅出现（新镜像在跑）", "=== stm32-edge-ai-node boot ===" in lines),
         ]
@@ -221,6 +270,59 @@ def evaluate(lines, corrupt):
         allok = allok and ok
     print("================ %s ================" % ("全部通过" if allok else "有未通过项"))
     return allok
+
+
+def do_confirm(args):
+    """`S8`：在**上电那 2 s 窗口**里发 `k`，把试运行计数清零（= 确认这个槽）。
+
+    🔴 **为什么必须"抢窗口"**：`k` 只在 **Bootloader** 的命令循环里被处理；而槽一旦合法，
+       Bootloader 打几行日志、开 2 s 窗口，然后就跳进 App 了 —— **App 里没有这条命令**。
+       ⇒ 每次确认都得"复位 + 窗口里补发"，不能指望板子在跑 App 时发得进去。
+
+    🔴 **不发会怎样**：`trial=1` 的槽**每次复位**都让 `boot_attempts` 加一，到 `max`（默认 3）
+       就自动回滚到另一个槽。所以正常升级完之后**必须发这一下**，否则日后正常断电重启
+       累计三次，新固件就被"冤枉"回滚了（`DECISIONS.md` D30 ①）。
+    """
+    import serial
+    port = args.port if args.port != "auto" else pick_port()
+    print("串口  : %s @ %d 8N1" % (port, args.baud))
+    ser = serial.Serial(port, args.baud, timeout=0.01)
+    dev = Dev(ser)
+    time.sleep(0.2)
+    ser.reset_input_buffer()
+
+    print(">> 复位一次，然后在窗口里每 150 ms 补发一次 'k'（设备窗口只有 2 s）")
+    try:
+        import subprocess
+        p = subprocess.run([args.stlink_cli, "-c", "port=SWD", "-rst", "-run"],
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        print("   >> ST-Link rc=%d" % p.returncode)
+    except Exception as e:                           # noqa: BLE001
+        print("   >> ST-Link 复位失败：%r（请现在手动按一下板上的 RESET）" % e)
+
+    t0 = time.time()
+    nxt = 0.0
+    while time.time() - t0 < 12.0:
+        dev._pump()
+        for ln in dev.new_lines():
+            if "confirming slot" in ln:
+                print("\n[OK] 已确认 -> %s" % ln.strip())
+                return 0
+            if "already confirmed" in ln:
+                print("\n[OK] 本来就是确认态 -> %s" % ln.strip())
+                return 0
+            if "confirm write FAILED" in ln:
+                print("\n[!!] 确认写失败 -> %s" % ln.strip())
+                return 2
+        if time.time() >= nxt:
+            # 🔴 **只发 `k` 一个字节、不要前置 `\n`**：设备的窗口轮询是"每 X ms 读 1 个字节"，
+            #    而 UART 的 RX 寄存器只有 1 个字节 ⇒ `\n` 和 `k` 紧挨着发时，`\n` 占住寄存器、
+            #    `k` 直接被溢出丢掉 —— 于是"每次都在发、设备一个都没收到"。2026-10-17 实测踩到。
+            ser.write(b"k")
+            nxt = time.time() + 0.15
+    print("\n[!!] 12 s 内没等到确认结果 —— 窗口只有 2 s，多半没撞上；重跑一次即可")
+    return 2
 
 
 def main():
@@ -243,13 +345,22 @@ def main():
                     help="STM32_Programmer_CLI.exe 的路径")
     ap.add_argument("--dry-run", action="store_true", help="只算不发自检，不碰串口")
     ap.add_argument("--selftest", action="store_true", help="跑固定向量自检后退出")
+    ap.add_argument("--expect-rollback", action="store_true",
+                    help="S8：换成「砖镜像试运行 -> 自动回滚」那套判据"
+                         "（砖镜像没有 App 横幅，套升级判据必然假失败）")
+    ap.add_argument("--confirm", action="store_true",
+                    help="S8：复位一次、在 2 s 窗口里发 'k' 确认当前槽（清零 trial/计数）。"
+                         "正常升级完**必须**跑一次，否则复位 3 次会自动回滚")
     args = ap.parse_args()
 
     if args.selftest:
         return selftest()
 
+    if args.confirm:
+        return do_confirm(args)
+
     if not args.bin:
-        ap.error("必须给 --bin（或用 --selftest）")
+        ap.error("必须给 --bin（或用 --selftest / --confirm）")
 
     blob = open(args.bin, "rb").read()
     n = len(blob)
@@ -274,7 +385,13 @@ def main():
 
     port = args.port if args.port != "auto" else pick_port()
     print("串口  : %s @ %d 8N1" % (port, args.baud))
-    ser = serial.Serial(port, args.baud, timeout=0.2)
+    # 🔴 `timeout` **必须小**（0.01，不是 0.2）。`Dev._pump()` 每次只读 1 字节，
+    #    端口 timeout 就是它"没数据时最多阻塞多久" —— 给 0.2 s 时，安静期每次
+    #    pump 都要空转 0.2 s，于是 `wait_for(0.25)` 一次只搬得动 2 个字节，
+    #    整条横幅要几十次调用才读完 ⇒ **主机发现 `[OTA] send:` 时，设备早就
+    #    起始行超时 abort 了**。2026-10-17 实测就是这个（表现成"设备已经跳回
+    #    App 了我们还以为它在等握手"）。0.01 s 让轮询跟得上 115200 的字节流。
+    ser = serial.Serial(port, args.baud, timeout=0.01)
     dev = Dev(ser)
     time.sleep(0.2)
     ser.reset_input_buffer()
@@ -308,7 +425,14 @@ def main():
     t0 = time.time()
     got = None
     while time.time() - t0 < args.wait:
-        ser.write(b"u\n")
+        # 🔴 **只发 `u` 一个字节、不要带 `\n`**（2026-10-17 修）：
+        #    窗口里的按键处理是**逐字符**的（`HAL_UART_Receive(...,1,0)`），根本不需要回车；
+        #    而带上 `\n` 之后，设备进 OTA 前会把这半个空行留到 `BlReadLine` 里，
+        #    变成一条 `not a start line: "u"`。更要命的是**那条 printf 要打 3~4 ms**，
+        #    期间 UART 接收寄存器（只有 1 个字节）把我们随后灌进去的握手行吃掉大半，
+        #    设备最终只读到 `"s"` —— 现象是**6 次补发全部失败**、看起来像"握手协议写错了"。
+        #    去掉 `\n` 之后通道是干净的，第一次就该成功。
+        ser.write(b"u")
         got = dev.wait_for("[OTA] send:", 0.25)
         if got:
             break
@@ -318,24 +442,42 @@ def main():
         return 2
 
     # ---- 2) 起始行 ----------------------------------------------------
-    # 🔴 2026-10-16 踩到：喊 'u' 的循环与握手行**会撞车**。
-    #    设备刚进 OTA、我们那句 wait_for 返回的同时，可能还有一个 `u\n` 在路上；
-    #    若它的 `\n` 被 UART 溢出吃掉，两行就粘成 `us42788,...`，
-    #    设备解不出来 —— 而它**只等 1 s 就会 abort**（`BL_OTA_LINE_TIMEOUT_MS`）。
-    #    两道防线：
-    #      ① 先 drain 一会儿，把在途的杂散 'u' 全收干净，再发握手；
-    #      ② 每次发握手都**前置一个 `\n`**，即使还有残渣也断得开；
-    #      ③ 没被接受就重发（设备侧对"坏行"有 8 次预算，只要别让它空等 1 s）。
+    # 🔴 **连踩三轮才找到的完整教训（2026-10-16 / 10-17）—— 这一节别再"猜"了**：
+    #
+    #    设备侧的事实（读 `bl_ota.c` 就知道）：`BlReadLine()` 用
+    #    `HAL_UART_Receive(&huart1, &b, 1, 3000)` **逐个字节**读，遇 `\r`/`\n` 结束。
+    #    而 UART 的**接收寄存器只有 1 个字节**，且 F4 的溢出语义是"**新字节被丢弃**"。
+    #
+    #    ① 喊 `u` 的循环每 200~250 ms 发一次。一旦某一次进了 OTA，**后一次 `u` 仍在路上**，
+    #       它会滞留在设备缓冲区里，等着和后面某个 `\n` 拼成一行 —— 日志里那条
+    #       `not a start line: "u"` 就是它。**这是确定性的，不是偶发。**
+    #    ② 设备打印这条日志要 **3~4 ms**，期间它**不在** `BlReadLine` 里 ⇒ 我们灌进去的
+    #       握手行会被 1 字节寄存器吃剩 **1 个字符**（`"s"`）⇒ 再等 3 s 没下文。
+    #       现象极像"握手协议写错了"，其实是**时序**问题。
+    #    ③ 所以主机侧要做三件事，缺一不可：
+    #       a. 进 OTA 后**先发一个孤立的 `\n`** 把滞留的 `u` 结束掉（清场），
+    #       b. **等它把 `not a start line` 打完**（120 ms 够），
+    #       c. 正式发起始行时**不再加前置 `\n`**（`build_start_line()` 自带行尾；
+    #          2026-10-17 加过一个尾 `\n`，结果第一帧变成 `bad SOF (0A A5)`，整段错位）。
+    #    ④ 判据仍然是"**看设备说没说这行不对**"，说不对就等 60 ms 再补发一次。
+    ser.write(b"\n")                    # a) 清场：结束滞留的半行
+    time.sleep(0.12)                    # b) 等它把提示打完、回到 BlReadLine
+    dev.drain(0.02)
+
     line = build_start_line(n, crc, args.ver)
     print("\n>> 起始行: %r" % line)
-    dev.drain(0.5)                       # ① 收干净在途的杂散 'u'
     got = None
-    for attempt in range(3):
-        ser.write(b"\n" + line.encode("ascii"))     # ② 前置 \n 防粘连
-        got = dev.wait_for("[OTA] erased OK", 6.0)
-        if got:
+    for attempt in range(8):
+        ser.write(line.encode("ascii"))  # c) 不带前缀，自己带行尾
+        hit = dev.wait_any(["[OTA] erased OK", "not a start line", "no start line"], 4.0)
+        if hit is not None and "erased OK" in hit:
+            got = hit
             break
-        print("   ... 起始行没被接受，重发（第 %d 次）" % (attempt + 2))
+        if hit is not None and "no start line" in hit:
+            print("   ... 设备等不到起始行、已经 abort —— 这条链路得整套重来")
+            break
+        print("   ... （第 %d 次没成）等 60 ms 再补发" % (attempt + 1))
+        time.sleep(0.06)
     if not got:
         print("\n🔴 擦除/握手没有成功（上面有设备的原话）")
         return 2
@@ -370,12 +512,12 @@ def main():
                     dev.drain(4.0)
                     # 🔴 退出码要跟着**判据**走，不是跟着"有没有升级成功"走：
                     #    S7 模式下"该失败的地方失败了"就是成功，必须返回 0。
-                    return 0 if evaluate("\n".join(dev.lines), args.corrupt) else 2
+                    return 0 if evaluate("\n".join(dev.lines), args.corrupt, args.expect_rollback) else 2
                 print("   ... 第 %d 帧被 NAK，重发（第 %d 次）" % (seq, tried + 1))
                 continue
             print("🔴 第 %d 帧等不到应答（token=%r）" % (seq, tok))
             dev.drain(3.0)
-            return 0 if evaluate("\n".join(dev.lines), args.corrupt) else 2
+            return 0 if evaluate("\n".join(dev.lines), args.corrupt, args.expect_rollback) else 2
         sent += len(payload)
         if (seq + 1) % 8 == 0 or seq == nframes - 1:
             el = time.time() - t0
@@ -386,10 +528,13 @@ def main():
     dev.drain(args.tail)
 
     # ---- 4) 判据（机器判，不靠肉眼看）--------------------------------
-    allok = evaluate("\n".join(dev.lines), args.corrupt)
-    if allok and args.corrupt is None:
+    allok = evaluate("\n".join(dev.lines), args.corrupt, args.expect_rollback)
+    if allok and args.expect_rollback:
+        print("⚠️ 已回滚：active_slot 现在是 **A**，Slot B 里仍躺着那个跑不起来的镜像（没被擦，这是对的）。")
+        print("   收尾必须再跑一次正常升级把 B 换回好镜像，然后 `--confirm` —— 否则以后切到 B 仍会回滚。")
+    elif allok and args.corrupt is None:
         print("⚠️ 板上现在是「Bootloader + Slot A + Slot B」且 active_slot=B。")
-        print("   要回到从 A 启动：走 RUNBOOK R13.2 用 ST-Link 烧回，或等 S8 的回滚。")
+        print("   现在处于试运行（trial）：跑稳了跑一次 `--confirm` 确认，否则复位 3 次会自动回滚。")
     if allok and args.corrupt is not None:
         print("⚠️ 目标槽 Slot B 已被擦除/写坏但**没有安装**；active_slot 仍是原值，")
         print("   下次上电应回退到另一槽（若目标槽本身已不可启动）。")

@@ -105,7 +105,17 @@ extern "C" {
 #define BL_OTA_WINDOW_MS        (2000U)
 #define BL_OTA_WINDOW_POLL_MS   (50U)     /* 窗口内的轮询周期 */
 
-#define BL_OTA_LINE_TIMEOUT_MS  (1000U)   /* 起始行**每字节**的超时 */
+#define BL_OTA_LINE_TIMEOUT_MS  (3000U)   /* 起始行**每字节**的超时
+                                           * 🔴 1000 ms **实测不够**（2026-10-16 S8 踩到）：
+                                           *    主机那边"喊 u 的循环"会留下 1 条在途的
+                                           *    `u\n`，它先被当成一行坏行吃掉；紧接着主机
+                                           *    还要 drain 一下、再从提示行反应到发握手 ——
+                                           *    这三件事叠起来经常 >1 s，于是设备在
+                                           *    "收到 u 了但没等到 s..." 的地方直接超时中止，
+                                           *    现象是主机狂报「起始行没被接受」而设备说
+                                           *    `no start line (timeout) -> abort`。
+                                           *    给到 3 s：主机侧有余量，代价只是"主机真掉线
+                                           *    时要多等 2 s 才放弃"。 */
 #define BL_OTA_FRAME_TIMEOUT_MS (3000U)   /* 一整帧（≤1031 B ≈ 90 ms）的超时，约 33 倍余量 */
 
 #define BL_OTA_LINE_MAX         (80U)     /* 起始行最长字符数 */

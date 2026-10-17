@@ -33,7 +33,7 @@ D:\STM32Projects\pc-venv\Scripts\python.exe
 | `check_pwm_cmd.py` | **PWM 命令通路验收**：不需要电机/电池的第 ⑦ 步验收（横幅 → `dNN` 回显 → `?` 信息行 → 归零）；`--led-test` 是第 ③ 步的 LED 目视验收；`--set NN` 停在某档不归零，配合万用表量电压 |
 | `calib_dev.py` | **六姿态静态标定**：把零偏 `b` 与增益 `k` **分开**（单姿态解不出来），产出 `calib.json` + C 头文件片段，并带**独立验证**（T3）；`--watch` 可实时看三轴、`--identify` 可先告诉你"手上这个面是哪个姿态" |
 | `watch.cmd` | **双击即可**的启动器 → `calib_dev.py --watch`（串口自动挑；`.cmd` 内**故意只用 ASCII**，中文输出全由 Python 负责） |
-| `ota_send.py` | **串口升级（OTA / `S6`）**：把一份 `.bin` 分包灌进 **Bootloader 的 Slot B**，停等重传 + 全程打印设备日志 + **升级后自动判定 6 条判据**；`--selftest` 帧格式固定向量、`--dry-run` 只算不发、`--corrupt N` 给 `S7` 用、`--stlink-reset` 省得手按 RESET |
+| `ota_send.py` | **串口升级（OTA / `S6`）**：把一份 `.bin` 分包灌进 **Bootloader 的 Slot B**，停等重传 + 全程打印设备日志 + **升级后自动判定 8 条判据**；`--selftest` 帧格式固定向量、`--dry-run` 只算不发、`--corrupt N` 造坏帧（给 `S7`/`S8`）、`--stlink-reset` 省得手按 RESET |
 | `selftest.py` | **自测**：317 条断言，不需要硬件 |
 
 ## 先跑自测（每次改完代码都该跑）
@@ -538,7 +538,7 @@ COM4  115200  8N1       # 直接看原始数据行
 | 一行数据都没有、`无法解析` 也在涨 | 波特率不对，或 `APP_OUTPUT_MODE` 与解析方式不匹配 |
 | `t=…` 一直在刷但 ax/ay/az 全是 0 | mode 2/3 二进制档下不会有文本 —— 切回 mode 0/1 |
 
-### 12) 串口升级（OTA · `S6`）与坏包拒收（`S7`）
+### 12) 串口升级（OTA · `S6`）、坏包拒收（`S7`）与回滚（`S8`）
 
 **这是 `ota_send.py` 的活**，与上面 1)–11) 那套"采数据"工具是两回事：上面都在 App 里跑，
 这个是**让 Bootloader 从 PC 收一份新固件**。
@@ -565,8 +565,14 @@ D:\STM32Projects\pc-venv\Scripts\python.exe tools\ota_send.py \
   --port COM5 --bin "D:\STM32Projects\_tmp\app_slotB.bin" --ver 2 --stlink-reset
 ```
 
-**跑完会自动判 6 条**（不靠肉眼看）：读完回 CRC32 与声明值一致 / 已置 `update_pending=1` /
-复位后走到提交步骤 / `active_slot` 切到 B / 真的跳到 Slot B / App 横幅出现。**全过才退出码 0。**
+**跑完会自动判 8 条**（不靠肉眼看）：读完回 CRC32 与声明值一致 / 🔵**元数据里的 `img B` 描述子对得上** /
+🔵**提交时的 `image crc32 OK … (readback recomputed)`** / 已置 `update_pending=1` /
+复位后走到提交步骤 / `active_slot` 切到 B / 🔵**`trial=1`（进入试运行）** / 真的跳到 Slot B 且 App 横幅出现。
+**全过才退出码 0。** 🔵 = `S8` 新增的三条。
+
+> 🔴 **升级完记得发一个 `k`**（在 App 里发不到 —— 要在**上电那 2 s 窗口里**发，或让
+> `ota_send.py` 之后手动复位再抢一次窗口）。不发的话**连续复位 3 次会自动回滚**
+> （`S8` 的试运行计数，见 `bootloader/README.md` "回滚" 一节与 `DECISIONS.md` `D30` ①）。
 
 #### 12.1 坏包拒收（`S7`）：`--corrupt N`
 
@@ -595,22 +601,67 @@ D:\STM32Projects\pc-venv\Scripts\python.exe tools\ota_send.py \
 先改 payload 再 `build_frame()` 的话，CRC 会照改后的数据重算 ⇒ 帧**自洽** ⇒ 设备**正确地**收下，
 测出来的根本不是帧层拒收（2026-10-16 首跑就踩了这个坑）。
 
-🔴 **残余（留给固件侧 `S8`）**：`--corrupt 20`（写到一半才失败）时，槽里"向量表完好、内容半截"，
-`BL_ImageCheck()` 只看头 8 字节 ⇒ 仍判 `valid` ⇒ **仍会 `JUMP -> slot B`**，之后板子**串口一个字都没有**。
-此时那条判据会 **FAIL**（4 PASS / 1 FAIL）—— 这是**预期**，见 `MVP/docs/context/RUNBOOK.md` **R13.12** 与 `RISKS` **R22**。
+✅ **`S8` 已把这条残余关掉**（`RISKS` R22 闭环）：`--corrupt 20`（写到一半才失败）时，槽里"向量表完好、内容半截"，
+`BL_ImageCheck()` 仍会判 `valid` —— 但**元数据里存着主机声明的 CRC32 与长度**，启动前会**从 Flash 读回整段重算**：
+
+```
+[BL] image crc32 MISMATCH: got 0x69F3D04F declared 0x612D7DCE over 42788 B
+[BL] slot B became INVALID during the update window -> NOT jumping
+[BL] JUMP -> slot A @0x0800C000 ... entry=0x0800E4C1
+```
+
+`--corrupt N`（N>0）的判据因此多两条：**半截镜像被镜像级 CRC32 抓住** + **最终回退到 Slot A**（实测 7/7 全过）。
 
 > 🔎 顺带一个反例教科书：`--corrupt 0` 之后 Slot B 是**空白**的，`active_slot` 仍是 `B` ⇒
 > 下次上电会 `falling back to slot A`。想恢复成"从 B 起"，**再跑一次不带 `--corrupt` 的正常升级**即可。
 
-**三个必须知道的坑**：
+**四个必须知道的坑**：
 
 | 现象 | 原因 / 对策 |
 |---|---|
 | 一直是 `🔴 没能进入升级模式` | `u` **只在上电后 2 秒内喊得到**（只要槽里有合法镜像，Bootloader 几毫秒就跳走了）。要么加 `--stlink-reset`，要么手按 RESET —— **单发一次 `u` 再傻等是错的**，脚本因此是"一直喊" |
 | `🔴 第 N 帧连发 5 次都被拒` | 帧对不上（CRC16 或 seq）。**这就是 `S7` 要验的行为** —— 故意用 `--corrupt N` 复现（见 §12.1），此时设备应当拒绝且**不改元数据**、下次上电仍跑旧版本 |
-"
-    "| `[OTA] not a start line: "us42788,…"` | 喊 `u` 的轮询与握手行**撞车**（进去那一刻还有一句 `u\n` 在路上，`\n` 被 UART 溢出吃掉 ⇒ 两行粘连），而设备**只等 1 s 就 abort**。已加三道防线：见到 `[OTA] send:` 后 `drain 0.5 s` / 握手行**前置 `\n`** / 6 s 未接受则**重发 ≤3 次** |
+| `[OTA] not a start line: "us42788,…"`，或者设备只读到 `"s"` | **握手全是时序问题**（2026-10-17 定案）：① 喊 `u` 时**带了 `\n`** —— 窗口按键是逐字符的，回车纯属多余，那个 `\n` 会滞留在设备缓冲里、和后面某个 `\n` 拼成一条 `not a start line: "u"`；② 设备打这条日志要 **3~4 ms**，期间它**不在** `BlReadLine` 里，而 UART 的 RX 寄存器**只有 1 个字节** ⇒ 灌进去的握手行被吃剩 1 个字符。现在的对策：**`u` 只发单字节** / 进 OTA 后**先发一个孤立 `\n` 清场**并等 120 ms / 正式发起始行**不加前缀** / 被拒后等 60 ms 再补发（≤8 次） |
 | 发了 SlotA 版镜像 | 设备会在 `[OTA] readback crc32 ... MISMATCH` 处拒收（链接基址不同，跳过去必崩，靠校验拦住） |
+
+#### 12.2 回滚（`S8`）：砖镜像 + `--expect-rollback`
+
+`S8` 要验的是"**内容完好、向量表合法，但一跑就崩**"这一类 —— 静态校验全过，只有跑起来才知道不行。
+诱饵镜像在 `bootloader/test/brick/`（540 B / `0xDB666DE1`，编译与自查见该目录 README）：
+
+```bash
+D://STM32Projects//pc-venv//Scripts//python.exe tools\ota_send.py \
+  --bin "/tmp/brick.bin" --port COM5 --ver 9 --expect-rollback --tail 14 --stlink-reset
+```
+
+预期（实测 **7/7 判据全过、退出码 0**）：
+
+```
+[BL] trial boot 1/3  ->  2/3  ->  3/3
+[BL] trial failed 3/3 (app_version 9) -> ROLLBACK slot B -> A
+[BL] ROLLBACK recorded; booting slot A instead
+[BL] JUMP -> slot A ... entry=0x0800E4C1
+```
+
+🔴 **必须加 `--expect-rollback`**：砖镜像**没有 App 横幅**，套用"升级成功"那 8 条里第 8 条必然 FAIL
+（第一版就报成 `7 PASS / 1 FAIL`、退出码 2，看着像回滚没成功）。这个开关换成专门的 7 条：
+读完回 CRC32 `MATCH` / 描述子落盘 / 提交且 `trial=1` / **`trial boot 1/3` 计数在涨** /
+**`trial failed -> ROLLBACK`** / **`ROLLBACK recorded`** / **`JUMP -> slot A`**。
+
+#### 12.3 确认（`S8`）：`--confirm`
+
+```bash
+D://STM32Projects//pc-venv//Scripts//python.exe tools\ota_send.py --confirm --port COM5
+#   | [BL] k: confirming slot B (trial 1->0, boot_attempts 2->0)
+```
+
+🔴 **正常升级完之后必须跑一次**：新固件处于"试运行"（`trial=1`），**每次复位**都让 `boot_attempts` 加一，
+到 3 就自动回滚 —— 不确认的话，日后正常断电重启累计三次，好固件也会被"冤枉"回滚。
+
+🔴 **为什么必须"抢窗口"**：`k` 只在 **Bootloader** 的命令循环里被处理，而槽一旦合法，Bootloader 2 s 后就跳进 App 了
+—— **App 里没有这条命令**。所以工具的做法是"复位一次 + 在窗口里每 150 ms 补发一个 `k`"。
+🔴 **而且只能发单字节 `k`**（不能 `\n`+`k`）：窗口每 X ms 只读 1 个字节，`\n` 占住寄存器会把 `k` 挤掉
+（2026-10-17 实测：主机觉得"一直在发"，设备一个都没收到）。
 
 > 🔴 **升级完 `active_slot` 就变成 B 了**，而且**没有命令能改回 A**（`m` 只会重写当前元数据）。
 > 回退路径见 `RUNBOOK.md` **R13.11** 末尾（ST-Link 烧回 / 等 `S8` 的回滚）。

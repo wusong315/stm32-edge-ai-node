@@ -7,6 +7,7 @@
 #include "main.h"
 #include "bl_config.h"
 #include "bl_jump.h"
+#include "bl_meta.h"          /* S8：镜像级判据要用 BL_Crc32 */
 
 #include <stdio.h>
 
@@ -65,8 +66,73 @@ const char *BL_ImgStatusStr(BL_ImgStatus st)
     case BL_IMG_BLANK:   return "blank (never programmed)";
     case BL_IMG_BAD_SP:  return "invalid: initial stack pointer not in RAM";
     case BL_IMG_BAD_RV:  return "invalid: reset vector not Thumb/out of slot";
+    case BL_IMG_BAD_CRC: return "invalid: image crc32 mismatch (partial/wrong write)";
     default:             return "invalid: unknown";
   }
+}
+
+/* =====================================================================
+ * 一·二、镜像级校验（S8）—— 在"头 8 字节"之上再加一道整镜像 CRC32
+ * =====================================================================
+ * 🔴 为什么非有不可：`BL_ImageCheck()` 只读**头 8 字节**（初始 MSP + Reset 向量）。
+ *    而 OTA 的擦除发生在**收数据之前**，所以"只写了前 20 帧就被判失败"的槽，
+ *    向量表（前 512 B，正好落在第 0 帧里）**完好无损** ⇒ 头校验判 valid
+ *    ⇒ Bootloader 照样跳进去 ⇒ App 拿着半截代码跑飞、板子静默。
+ *    2026-10-16 实测到过这个现象（PC 侧 3 s 收到 0 字节）。**只有整镜像 CRC 能拦。** */
+BL_ImgStatus BL_ImageCheckCrc(uint32_t addr, uint32_t size,
+                              uint32_t dCrc, uint32_t dLen,
+                              uint32_t *sp, uint32_t *rv, int verbose)
+{
+  BL_ImgStatus st = BL_ImageCheck(addr, size, sp, rv);
+  uint32_t     got;
+
+  if (st != BL_IMG_OK)
+  {
+    return st;                                  /* 头 8 字节就不行，不必再算 CRC */
+  }
+
+  if (dLen == 0U)
+  {
+    /* 没有描述子（例如用 ST-Link 直接灌进 Slot A 的镜像）：
+     * 退回仅头校验 —— 但**必须把这件事说出来**，否则
+     * "为什么这个槽没被拦"永远是笔糊涂账。 */
+    if (verbose != 0)
+    {
+      printf("[BL]   (no crc32 descriptor for this slot -> header-only check)\r\n");
+    }
+    return BL_IMG_OK;
+  }
+
+  if (dLen > size)
+  {
+    /* 描述子自己就不自洽（比槽还大）⇒ 不可信，宁可拒收。 */
+    if (verbose != 0)
+    {
+      printf("[BL]   descriptor len %lu > slot size %lu -> reject\r\n",
+             (unsigned long)dLen, (unsigned long)size);
+    }
+    return BL_IMG_BAD_CRC;
+  }
+
+  /* 🔴 "读回整段重算" —— 与 OTA 结束时那次读回校验是**同一个判据**，
+   *    只是执行者从"收数据的人"换成了"要跳转的人"。 */
+  got = BL_Crc32((const uint8_t *)addr, dLen);
+  if (got != dCrc)
+  {
+    if (verbose != 0)
+    {
+      printf("[BL]   image crc32 MISMATCH: got 0x%08lX declared 0x%08lX over %lu B\r\n",
+             (unsigned long)got, (unsigned long)dCrc, (unsigned long)dLen);
+    }
+    return BL_IMG_BAD_CRC;
+  }
+
+  if (verbose != 0)
+  {
+    printf("[BL]   image crc32 OK: 0x%08lX over %lu B (readback recomputed)\r\n",
+           (unsigned long)got, (unsigned long)dLen);
+  }
+  return BL_IMG_OK;
 }
 
 /* =====================================================================

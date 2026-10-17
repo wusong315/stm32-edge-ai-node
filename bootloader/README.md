@@ -27,27 +27,28 @@
 
 ---
 
-## 2. 当前进度：**S7**（推演稿 §7）
+## 2. 当前进度：**`S8` 完成 ⇒ `S2`–`S8` 全部收口**（推演稿 §7）
 
 | 项 | 结果 |
 |---|---|
 | 命令行编译 | ✅ **0 error / 0 warning**，`make clean && make all` 全量重编（26 个目标文件） |
 | `.isr_vector` VMA | ✅ `0x08000000`（`objdump -h` 实测） |
 | 向量表内容 | ✅ 初始 MSP `0x20020000`（RAM 顶）+ Reset 向量（奇数、落在本区） |
-| Flash 占用 | 🔴 **29 888 B ≈ 29.19 KB / 32 KB（91.2 %）**，`.data` 末地址 `0x080074C8` |
-| ↳ 距参数区起点 | 🔴 只剩 **2 872 B** 才碰到 `0x08008000`（`FLASH LENGTH = 32K` 仍是硬护栏） |
-| RAM 占用 | ✅ `data 140 + bss 3 012 = 3 152 B`（含 `.ld` 预留的 heap 512 + stack 1 024；**新增的 1 024 B 是收包缓冲，必须是 `static`**） |
+| Flash 占用 | 🔴 **32 344 B ≈ 31.59 KB / 32 KB（98.7 %）**（`text 32 204 + data 140`） |
+| ↳ 余量 | 🔴 **只剩 424 B** 就碰到参数区 `0x08008000`（`FLASH LENGTH = 32K` 仍是硬护栏） |
+| RAM 占用 | ✅ `data 140 + bss 3 012 = 3 152 B`（含 `.ld` 预留的 heap 512 + stack 1 024；**收包缓冲 1 024 B 必须是 `static`**） |
 | 串口升级（`S6`） | 🎉 **2026-10-16 一次跑通，6/6 判据全过**：42 帧 / 42 788 B / 4.1 s / 10.2 KB·s⁻¹；读完回 CRC32 `MATCH`；ST-Link 把 Slot B 读回**逐字节相同**；复位后 `active_slot=B` 并跳到 B |
-| 坏包拒收（`S7`） | 🎉 **2026-10-16 跑通，5/5 判据全过**：`frame 0 crc16 FAIL -> NAK` ×8 → `gave up after 8 tries -> abort` → **不置标志、不提交** → `slot B became INVALID during the update window -> NOT jumping` → `NOTE: falling back to slot A` → `JUMP -> slot A … entry=0x0800E4C1`。🔴 同时修掉两个真问题（`--corrupt` 没造出坏帧 / 窗口后沿用陈旧判断），并**留下一条残余给 `S8`**："写了一半但向量表完好"的槽仍会跳进去 |
+| 坏包拒收（`S7`） | 🎉 **2026-10-16 跑通，5/5 判据全过**：`frame 0 crc16 FAIL -> NAK` ×8 → `gave up -> abort` → **不置标志、不提交** → `slot B became INVALID … -> NOT jumping` → `JUMP -> slot A … entry=0x0800E4C1`。🔴 同批修掉两个真问题（`--corrupt` 没造出坏帧 / 窗口后沿用陈旧判断） |
+| 回滚（`S8`） | 🎉 **2026-10-16 三项全过**：① **镜像级 CRC32** 判据 ⇒ `--corrupt 20` **7/7**（`image crc32 MISMATCH: got 0x69F3D04F declared 0x612D7DCE over 42 788 B` → `NOT jumping` → `JUMP -> slot A`，**`RISKS` R22 闭环**）；② **复位计数回滚** ⇒ 砖镜像 **8/8**（`trial failed 3/3 (app_version 9) -> ROLLBACK slot B -> A`，零人工干预）；③ 正常升级 **8/8**；另有 `k` 确认实测 |
 
 > ⚠️ 以上是 **Debug（`-O0`）** 的体积。Release（`-Os`）会明显更小 —— 但 Bootloader 本来就跑在启动关键路径上，
 > 「Debug 版也塞得下 32 KB」是更强的结论，所以以 Debug 数字为准。
 
-> 🔴 **预算账（`RISKS` R21 的实测答案）**：`S3`→`S6` 用掉 **+5 744 B**，其中 **约 2.6 KB 是 `.rodata`（日志文案）** ——
+> 🔴 **预算账（`RISKS` R21 的实测答案）**：`S3`→`S6` 用掉 **+5 744 B**，其中 **约 2.6 KB 是 `.rodata`（日志文案）**；
+> `S7` 的 Fix A 再吃 **132 B**；**`S8`（镜像级 CRC32 + 回滚）再吃 2 456 B**（`.rodata` 5 928 → **7 140 B**）。
 > 也就是说「多打印几行」和「多写一个函数」是同一量级的代价，**日志不是免费的**。
-> 余量 **2 872 B**（`S7` 的 Fix A 又花掉 **132 B**）。`S7` 的坏包拒收**设备侧本来就不用新代码**，
-> 余量只留给 **`S8`（回滚）** —— 而 `S8` 的核心是"镜像级 CRC32 判据"（见下方 §3 与 `RUNBOOK.md` R13.12）。
-> 真到编不下那天，退路依次是：① 本工程改 `-Os`（**未用过，依然完好**）；② 精简日志文案；③ 极端情况才动分区表。
+> 🔴 **余量只剩 424 B** —— 连"多打印三行"都装不下。**功能面到此为止**；
+> 真要再加东西，退路依次是：① 本工程改 `-Os`（**仍未用过，依然完好** —— 且这是**下一个动作**）；② 精简日志文案；③ 极端情况才动分区表。
 
 ---
 
@@ -57,13 +58,15 @@
 Core/Src/
   main.c      最小初始化（GPIO + USART1）→ BL_Run()
   bl_boot.c   编排：横幅 → 分区表自检 → 两个 CRC 自检 → 读/自愈元数据
-              → 升级提交（update_pending→active_slot）→ 决策 → 上电升级窗口 → 跳或等
+              → 升级提交（update_pending→active_slot）→ **试运行计数/回滚(trial)**
+              → 决策 → 上电升级窗口 → 跳或等
   bl_flash.c  扇区层：地址↔扇区号派生 / 擦除 / 编程 / 分区表机器自检
-  bl_meta.c   元数据层：CRC32 + 顺序追加日志 + 自愈 + 写后读回校验
-  bl_jump.c   跳转层：镜像校验 + 外设 DeInit + 跳转
-  bl_ota.c    【S6 新增】串口升级：帧层 CRC16 + 文本握手 + 停等收帧
-              + 写 Slot B + 读回整镜像 CRC32 + 置 update_pending
+  bl_meta.c   元数据层：CRC32 + 顺序追加日志 + 自愈 + 写后读回校验 + 镜像描述子
+  bl_jump.c   跳转层：镜像校验（**头 8 字节 + 整镜像 CRC32**）+ 外设 DeInit + 跳转
+  bl_ota.c    【S6】串口升级：帧层 CRC16 + 文本握手 + 停等收帧
+              + 写 Slot B + 读回整镜像 CRC32 + 置 update_pending + **写描述子**
 Core/Inc/  同名头文件 + bl_config.h（分区表唯一来源）+ bl_ota.h（**帧格式唯一来源**）
+test/brick/ 【S8】「启动即复位」诱饵镜像（**只用来验回滚**，不参与任何构建）
 ```
 
 三层拆开是为了**每一步都能直接复用**：`bl_flash.c` 的擦/写被 `bl_ota.c` 直接用；
@@ -72,13 +75,14 @@ Core/Inc/  同名头文件 + bl_config.h（分区表唯一来源）+ bl_ota.h（
 ### 启动时序（串口上能看到的）
 
 ```
-横幅(v0.4 + 构建时间 + SYSCLK + 分区表)
+横幅(v0.6 + 构建时间 + SYSCLK + 分区表)
   └─ flash map verify   ← 逐个分区：由地址反推的扇区号 == 期望值？+ 是否整数个完整扇区？
   └─ crc32 selftest     ← "123456789" -> 0xCBF43926 ?（元数据完整性全靠它）
   └─ crc16 selftest     ← "123456789" -> 0xBB3D ?（升级帧层完整性全靠它）
   └─ metadata region raw head + scan 统计
   └─ 无有效记录 ⇒ self-heal（擦 S2 + 写默认值）⇒ 写后读回校验 ⇒ 再扫一次
-  └─ update_pending=1 ⇒ 复验 Slot B ⇒ 提交（active_slot→B、清标志）→ **重新扫一遍元数据**
+  └─ update_pending=1 ⇒ 复验 Slot B ⇒ 提交（active_slot→B、清标志、**trial=1**）→ **重新扫一遍元数据**
+  └─ 【S8】trial=1 ⇒ boot_attempts+1 写回（**达上限就改 active_slot 回另一个槽**）
   └─ boot decision      ← 合法就跳（**跳之前先开 2 s 升级窗口**）；不合法 ⇒ safe wait
 ```
 
@@ -88,6 +92,7 @@ Core/Inc/  同名头文件 + bl_config.h（分区表唯一来源）+ bl_ota.h（
 |---|---|
 | `?` | 帮助 |
 | **`u`** | **进入串口升级模式**（`S6`）—— 上电窗口里、或安全等待模式里都能用 |
+| **`k`** | 【`S8`】**确认当前槽通过试运行**（`trial=0`、`boot_attempts=0`）—— 见下方"回滚" |
 | `m` | **重写元数据 + 读回校验**（"写→读回→CRC 一致"的随取随验入口，不必重新上电） |
 | `r` | 重新扫描元数据 + 打印两个槽状态 |
 
@@ -109,10 +114,40 @@ Core/Inc/  同名头文件 + bl_config.h（分区表唯一来源）+ bl_ota.h（
 > ⚠️ **升级目标槽当前固定是 Slot B**，且必须发 **SlotB 链接版镜像**（`SlotB/stm32-edge-ai-node.elf` → `objcopy -O binary`）。
 > 一旦 `active_slot=B`，中途失败的升级会污染**正在运行的槽**。
 >
-> 🔴 **`S7` 实测更正**：原先写的"靠回退到另一槽兜底"**只对了一半** ——
-> 回退**只在目标槽真的不可启动时**才发生（`S7` 修了这半边：上电升级窗口返回后**重新判一次**目标槽，`bl_boot.c`）；
-> 但 `BL_ImageCheck()` 只看**头 8 字节**，所以"**擦一半/写一半**"的槽**向量表往往完好** ⇒ 仍被判 `valid` ⇒ **照样跳进去**
-> （实测：跳进半截镜像后板子 **3 s 内 0 字节**，完全静默）。这一半留给 **`S8`**，见 `RUNBOOK.md` **R13.12** 与 `RISKS` **R22**。
+> ✅ **"写了一半的槽仍会跳进去"这个缺陷已在 `S8` 修掉**（`RISKS` R22 闭环）。两层判据各管一件事：
+> `BL_ImageCheck()` 只读**头 8 字节**（够快，但"擦一半/写一半"的槽**向量表往往完好**）；
+> `BL_ImageCheckCrc()` 再加一层 —— 元数据里存着**主机声明的 CRC32 与长度**，启动前**从 Flash 读回整段重算**再比。
+> 实测（`--corrupt 20`）：`image crc32 MISMATCH: got 0x69F3D04F declared 0x612D7DCE over 42 788 B` → `NOT jumping` → `JUMP -> slot A`。
+> 详见 `RUNBOOK.md` **R13.13**。
+
+### 回滚（`S8`）：靠"复位次数"兜住"合法但跑不起来"的镜像
+
+`S8` 要兜的不是"内容坏掉"（那有 CRC32 管），而是"**内容完好、向量表合法、但一跑就崩**" —— 这种镜像能过所有静态校验，
+只有跑起来才知道不行。解法是**试运行计数**：
+
+| 字段 | 含义 |
+|---|---|
+| `trial` | 1 = 这个槽还没被确认过（刚提交上来） |
+| `boot_attempts` | 试运行期间已经启动过几次 |
+| `max_boot_attempts` | 上限，默认 **3** |
+
+- **提交**升级时：`active_slot→B`、`trial=1`、`boot_attempts=0`；
+- **每次上电**：`trial==1` ⇒ `boot_attempts+1` 写回；到 `>= max` ⇒ **`active_slot` 改回另一个槽、`trial=0`、计数清零**；
+- 🔴 **回滚只改一个字节的 `active_slot`，不擦任何 Flash** —— 旧槽原样还在，这是"回滚"能成立的物理原因；
+- **确认**：跑稳了发一个 `k`（`trial=0`、计数清零）。`S8` 实测：
+
+```
+[BL] trial boot 1/3 → 2/3 → 3/3            ← 砖镜像每次上电就把自己复位
+[BL] 🔴 trial failed 3/3 (app_version 9) -> ROLLBACK slot B -> A
+[BL] JUMP -> slot A … entry=0x0800E4C1
+```
+
+🔴 **已知局限（`DECISIONS.md` D30 ①，刻意不做）**：**App 起来后不会自动确认**。
+⇒ **每次正常升级完要发一个 `k`**，否则连续复位 3 次就自动回滚（即使新固件完全正常）。
+正解（App 回写 `trial=0`）要碰参数区 + 三个 Build Configuration，按取舍留作局限。
+
+**为什么"复位次数"就是够用的计数**：能正常跑的固件**不会自己复位**；"启动即崩"的固件**必然不断复位**
+⇒ 计数器**必然爬满** ⇒ **必然回滚**。这就是"零 App 改动也能做回滚"的全部理由。
 
 ---
 

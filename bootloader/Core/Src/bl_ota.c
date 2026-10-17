@@ -461,7 +461,8 @@ int BL_OtaRun(void)
   if (rbCrc != wantCrc)
   {
     printf("[OTA] image REJECTED (slot B content != sent file) -> stay in bootloader\r\n");
-    printf("[OTA] note: slot B now holds a partial/garbage image; it will NOT be booted.\r\n");
+    printf("[OTA] note: slot B now holds a partial image; its crc32 no longer matches\r\n");
+    printf("[OTA]       the descriptor in metadata -> boot decision will reject it (S8).\r\n");
     return 0;
   }
 
@@ -491,6 +492,17 @@ int BL_OtaRun(void)
   m.app_version    = ver;
   m.boot_attempts  = 0U;
 
+  /* 🔴 S8：把**声明的**镜像描述子记进元数据 —— 这是"镜像级判据"的数据来源。
+   *    用 `wantCrc`（主机声明值）而不是 `rbCrc`（刚读回算出来的值）是刻意的：
+   *    上一节已经证明 `rbCrc == wantCrc`（否则早就 return 0 了），两者此刻
+   *    等价；而"记声明值"让整条链变成
+   *      主机声明 → 本次读回相符 → 以后每次启动读回都要相符
+   *    —— 任何一环对不上都会被抓住，且不会出现"用自己算的值给自己背书"。
+   *    ⚠️ 只记 Slot B：本工程的 OTA 目标槽固定是 B（D28）。 */
+  m.img[BL_SLOT_ID_B].crc32 = wantCrc;
+  m.img[BL_SLOT_ID_B].len   = len;
+  m.trial                   = 0U;   /* 试运行位在"提交"那一步（复位之后）才置 1 */
+
   if (BL_MetaWrite(&m) != 1)
   {
     printf("[OTA] staged meta write FAILED -> abort (slot B will NOT be booted)\r\n");
@@ -502,8 +514,8 @@ int BL_OtaRun(void)
   {
     BL_MetaPrint(&m, "staged");
   }
-  printf("[OTA] staged: update_pending=1 app_version=%lu active_slot untouched\r\n",
-         (unsigned long)ver);
+  printf("[OTA] staged: update_pending=1 app_version=%lu img B desc %luB/0x%08lX\r\n",
+         (unsigned long)ver, (unsigned long)len, (unsigned long)wantCrc);
   printf("[OTA] done -> rebooting to install\r\n");
   return 1;
 }

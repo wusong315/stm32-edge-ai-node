@@ -202,6 +202,16 @@ void BL_MetaPrint(const BL_Meta_t *m, const char *tag)
          (long)(m->calib_b[0] * 1000.0f), (long)(m->calib_b[1] * 1000.0f),
          (long)(m->calib_b[2] * 1000.0f),
          (unsigned long)m->crc32);
+
+  /* 🔴 `S8` 的镜像描述子是"拒收半截镜像"的唯一依据，必须一眼看得见：
+   *    `len=0` 就是"这一槽没有描述子 ⇒ 只能做仅头校验"这个事实的物证。 */
+  printf("[BL] %s: trial=%u img A=%luB/0x%08lX  B=%luB/0x%08lX\r\n",
+         tag,
+         (unsigned)m->trial,
+         (unsigned long)m->img[BL_SLOT_ID_A].len,
+         (unsigned long)m->img[BL_SLOT_ID_A].crc32,
+         (unsigned long)m->img[BL_SLOT_ID_B].len,
+         (unsigned long)m->img[BL_SLOT_ID_B].crc32);
 }
 
 void BL_MetaPrintRaw(void)
