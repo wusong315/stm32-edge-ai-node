@@ -670,11 +670,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--min-amp", type=float, default=DEFAULT_MIN_AMP_G,
                    help="峰幅值绝对下限 g，默认 0.002")
     p.add_argument("--blade-band", type=float, nargs=2,
-                   default=list(DEFAULT_BLADE_BAND), metavar=("LO", "HI"),
-                   help="叶频搜索带 Hz，默认 %g %g（🔴 下沿应高于 2× 转频）"
-                        % DEFAULT_BLADE_BAND)
+                   default=None, metavar=("LO", "HI"),
+                   help="叶频搜索带 Hz。缺省：给了 `--rot-band` 就按 "
+                        "%g×[rot]×[0.85,1.15] **自动推导**，否则用计划值 %g %g"
+                        "（🔴 自动推导时下沿仍可能压到 2× 转频，注意看提示）"
+                        % (DEFAULT_BLADE_MULTIPLE, DEFAULT_BLADE_BAND[0], DEFAULT_BLADE_BAND[1]))
     p.add_argument("--rot-band", type=float, nargs=2,
-                   default=list(DEFAULT_ROT_BAND), metavar=("LO", "HI"),
+                   default=None, metavar=("LO", "HI"),
                    help="转频搜索带 Hz，默认 %g %g" % DEFAULT_ROT_BAND)
     p.add_argument("--blade-multiple", type=float,
                    default=DEFAULT_BLADE_MULTIPLE, metavar="K",
@@ -692,6 +694,30 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_argparser().parse_args(argv)
+
+    # 🔴 2026-10-17 修正：`--blade-band` 老默认是**计划值** 300–660 Hz
+    #    （3 叶 × 6000–13000 RPM）。真机实测叶频只有 **155–195 Hz**，于是门禁去
+    #    300–660 Hz 里找峰，抓到 325 Hz 的环境峰，最后给出一句
+    #    「❌ 叶频带没有明显高于本底的峰」—— 而 160 Hz 处的叶频峰明明白白就在那儿。
+    #    这不是算法错，是**默认带和现实脱节**，报错文案却像在否定数据本身。
+    #    现在：只要给了 `--rot-band`，就按 K×[rot]×(1±15%) 自动推开搜索带；
+    #    没给才退回计划值（并明说一句，别让人以为这是实测值）。
+    rot_explicit = args.rot_band is not None
+    if args.rot_band is None:
+        args.rot_band = list(DEFAULT_ROT_BAND)
+    if args.blade_band is None:
+        if rot_explicit:
+            k = args.blade_multiple
+            lo, hi = args.rot_band
+            args.blade_band = [k * lo * 0.85, k * hi * 1.15]
+            print("[i] 叶频带未给 ⇒ 由 --rot-band 自动推导：%g × [%g, %g] × [0.85, 1.15] "
+                  "= [%.0f, %.0f] Hz" % (k, lo, hi, args.blade_band[0], args.blade_band[1]))
+        else:
+            args.blade_band = list(DEFAULT_BLADE_BAND)
+            print("[!] 叶频带用**计划值** %g–%g Hz（不是实测值）。"
+                  % (DEFAULT_BLADE_BAND[0], DEFAULT_BLADE_BAND[1]))
+            print("    真机叶频不在这个范围时会给出误导性的「❌ 没有峰」"
+                  "—— 请改用 --rot-band 让它自动推导，或直接 --blade-band 指定。")
 
     print("=" * 68)
     print("check_blade_peak.py · R17 频谱门禁")
