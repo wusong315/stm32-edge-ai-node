@@ -33,7 +33,7 @@ D:\STM32Projects\pc-venv\Scripts\python.exe
 | `check_pwm_cmd.py` | **PWM 命令通路验收**：不需要电机/电池的第 ⑦ 步验收（横幅 → `dNN` 回显 → `?` 信息行 → 归零）；`--led-test` 是第 ③ 步的 LED 目视验收；`--set NN` 停在某档不归零，配合万用表量电压 |
 | `calib_dev.py` | **六姿态静态标定**：把零偏 `b` 与增益 `k` **分开**（单姿态解不出来），产出 `calib.json` + C 头文件片段，并带**独立验证**（T3）；`--watch` 可实时看三轴、`--identify` 可先告诉你"手上这个面是哪个姿态" |
 | `watch.cmd` | **双击即可**的启动器 → `calib_dev.py --watch`（串口自动挑；`.cmd` 内**故意只用 ASCII**，中文输出全由 Python 负责） |
-| `ota_send.py` | **串口升级（OTA / `S6`）**：把一份 `.bin` 分包灌进 **Bootloader 的 Slot B**，停等重传 + 全程打印设备日志 + **升级后自动判定 8 条判据**；`--selftest` 帧格式固定向量、`--dry-run` 只算不发、`--corrupt N` 造坏帧（给 `S7`/`S8`）、`--stlink-reset` 省得手按 RESET |
+| `ota_send.py` | **串口升级（OTA / `S6`）**：把一份 `.bin` 分包灌进 **Bootloader 的 Slot B**，停等重传 + 全程打印设备日志 + **升级后自动判定 8 条判据**；`--selftest` 帧格式固定向量、`--dry-run` 只算不发、`--corrupt N` 造坏帧（给 `S7`/`S8`）、`--expect-rollback` 换回滚判据、`--confirm` 发 `k` 确认、**`--silent-app` 换"数二进制帧"判据（给 mode 2/3 这种不打字的 App）**、`--stlink-reset` 省得手按 RESET |
 | `selftest.py` | **自测**：317 条断言，不需要硬件 |
 
 ## 先跑自测（每次改完代码都该跑）
@@ -668,6 +668,33 @@ D://STM32Projects//pc-venv//Scripts//python.exe tools\ota_send.py --confirm --po
 > ⚠️ 已知局限：目标槽固定 Slot B ⇒ 一旦 `active_slot=B`，**中途失败**的升级会污染正在运行的槽。
 > 🔴 **"靠回退到另一槽兜底"只对了一半**（`S7` 实测更正）：只有目标槽**真的不可启动**才会回退；
 > "写了一半但向量表完好"的槽仍会被跳进去（板子静默）⇒ 见 `RUNBOOK.md` **R13.10.6 / R13.12**、`RISKS` **R22**。
+
+#### 12.4 静默 App（`--silent-app`）：`APP_OUTPUT_MODE=2/3` 这类"不说话"的固件
+
+`mode 2` 的 App **一个字符都不打**（没有横幅、没有 LED 心跳，只有 1 kHz 二进制帧）。
+前 7 条判据看的是 **Bootloader** 的行为，照旧有效；**第 8 条「App 横幅出现」必然 FAIL**
+—— 这不是失败，是判据套错了（和 `--expect-rollback` 那个坑同一类）。
+
+`--silent-app` 把第 8 条换成 **「收到 ≥3 个合法二进制帧」**：
+
+```bash
+D://STM32Projects//pc-venv//Scripts//python.exe tools\ota_send.py \
+  --bin "D:/STM32Projects/_tmp/app_slotB_mode2.bin" --port COM5 --ver 3 \
+  --silent-app --stlink-reset
+```
+
+```
+   >> 静默 App：抓到 412 个合法二进制帧（原始字节 79.8 KB）
+  [PASS] App 在跑：收到 412 个合法二进制帧（mode 2 不打文字，改看帧）
+```
+
+🔴 **数的是"校验正确的帧"，不是 `AA 55` 的个数**：三轴 int16 原始数据里出现 `AA 55` 太便宜，
+拿它当证据随时假阳性。这里复用 `vibframe.FrameParser`（流式 + 自恢复 + 校验和/点数双重把关）。
+🔴 二进制被 `\n` 切出来的乱码行**照样进 `lines`**（判据还要用），只是**不再打到屏幕上** ——
+否则 1 kHz 的流会把 `JUMP -> slot B` 那几行冲走。
+✅ `--selftest` 里有一对**能证伪**的向量：同一段**没有横幅**的合成日志，`silent_app` 传 5 个帧 ⇒ PASS，
+不传 ⇒ FAIL —— 证明这个开关真的改了判定，而不是只改了一行文字。
+⚠️ `--confirm` 不受影响（`k` 是 Bootloader 的命令，BL 永远打文字）。
 
 ## 命令行参数
 

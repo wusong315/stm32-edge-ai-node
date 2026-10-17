@@ -75,6 +75,37 @@ def build_start_line(length, crc32, ver=None):
     return "s%u,%08x,%u\n" % (length, crc32 & 0xFFFFFFFF, ver)
 
 
+def _texty(s):
+    """这行像不像**人写的文本**（用来把二进制帧被 `\\n` 切出来的碎片过滤掉）。
+
+    mode 2 的 App 每 1 ms 吐 198 B 裸二进制，流的形态是"随机字节 + 偶尔 0x0A"，
+    `Dev` 按行切完会得到成百上千条乱码行。直接把它们打到屏幕上会淹掉
+    Bootloader 那几行真正要看的日志（`JUMP -> slot B` 之类）。
+    """
+    if not s:
+        return False
+    bad = sum(1 for ch in s if ord(ch) < 32 or ch == "\ufffd")
+    return bad * 3 <= len(s)
+
+
+def count_frames(raw):
+    """数 `raw` 里**校验正确**的二进制帧个数 —— mode 2 的 App 唯一能留下的证据。
+
+    🔴 **为什么不用"数 `AA 55`"了事**：payload 里偶然出现 `AA 55` 太便宜了
+       （三轴 int16 的原始数据里出现这两个字节是常态），那样的"证据"随时能假阳性。
+       `vibframe.FrameParser` 是流式 + 自恢复 + **校验和 + 点数双重把关**，
+       它认下的帧才真的说明"有个按协议打包的固件在跑"。
+    """
+    if not raw:
+        return 0
+    try:
+        import vibframe                                    # 同目录，纯本地
+    except Exception as e:                                 # noqa: BLE001
+        print("   >> 无法 import vibframe（%r）—— 退回按同步头裸计数（仅供参考）" % e)
+        return bytes(raw).count(b"\xaa\x55")
+    return len(vibframe.FrameParser().feed(bytes(raw)))
+
+
 def selftest():
     """固定向量自检。全部通过返回 0。"""
     bad = 0
@@ -98,6 +129,44 @@ def selftest():
     print("start line = %r %s" % (line, "PASS" if ok else "FAIL"))
     bad += 0 if ok else 1
 
+    # 🔵 `--silent-app` 的地基一：帧计数必须**只认校验正确的帧**。
+    #    构造 3 个合法帧 + 1 个"只改坏校验和"的帧 + 前后噪声 ⇒ 期望正好 3。
+    try:
+        import vibframe
+        zero = [0] * 32
+        good = b"".join(vibframe.encode_frame(i, zero, zero, zero) for i in range(3))
+        broken = bytearray(vibframe.encode_frame(9, zero, zero, zero))
+        broken[-1] ^= 0xFF                        # 只坏校验和，帧结构完好
+        got = count_frames(b"\r\nnoise\x00\x01" + good + bytes(broken) + b"\r\n")
+        ok = (got == 3)
+        print("count_frames(3 帧 + 1 坏校验 + 噪声) = %d (expect 3) %s"
+              % (got, "PASS" if ok else "FAIL"))
+        bad += 0 if ok else 1
+    except Exception as e:                        # noqa: BLE001
+        print("count_frames 自检 SKIP（%r —— 缺 numpy/vibframe 不影响发帧）" % e)
+
+    # 🔵 `--silent-app` 的地基二：**同一段没有 App 横幅的日志**，
+    #    加 `--silent-app` 必须 PASS、不加必须 FAIL —— 这样才能证明这个开关
+    #    真的改了判定，而不是只改了一行文字。
+    import contextlib
+    import io
+    syn = "\n".join([
+        "[OTA] readback crc32 MATCH",
+        "[OTA] staged: update_pending=1",
+        "[OTA] img B desc recorded",
+        "update_pending=1 -> verify slot B",
+        "[OTA] image crc32 OK",
+        "[OTA] install: active_slot B -> B trial=1",
+        "[OTA] JUMP -> slot B",
+    ])
+    with contextlib.redirect_stdout(io.StringIO()):
+        v_silent = evaluate(syn, None, False, True, 5)     # 5 个帧 ⇒ 应 PASS
+        v_loud = evaluate(syn, None, False, False, 0)      # 没横幅 ⇒ 应 FAIL
+    ok = (v_silent is True and v_loud is False)
+    print("evaluate(silent_app=5 帧)=%s / (默认,无横幅)=%s -> %s"
+          % (v_silent, v_loud, "PASS" if ok else "FAIL"))
+    bad += 0 if ok else 1
+
     print("---- selftest: %s ----" % ("ALL PASS" if bad == 0 else "%d FAILED" % bad))
     return 0 if bad == 0 else 1
 
@@ -118,19 +187,30 @@ class Dev(object):
         self.buf = bytearray()
         self.lines = []
         self._mark = 0
+        # `--silent-app` 用：mode 2 的 App **一句话都不说**，只有二进制帧。
+        # 想验"它真的在跑"就得把原始字节留着，事后再拿帧解析器数一遍。
+        self.raw = bytearray()
+        self.capture_raw = False
+        self.raw_cap = 8 * 1024 * 1024       # 1 kHz × 198 B ≈ 198 KB/s，8 MB 够 40 s
+        self.quiet_binary = False            # True 时不再把二进制碎片当日志打出来
 
     # -- 内部：读 1 字节，必要时打行 / 返回令牌 ---------------------------
     def _pump(self):
         d = self.ser.read(1)
         if not d:
             return None
+        if self.capture_raw and len(self.raw) < self.raw_cap:
+            self.raw.extend(d)
         b = d[0]
         if b in (0x0A, 0x0D):
             if self.buf:
                 line = self.buf.decode("utf-8", "replace")
                 self.buf.clear()
                 self.lines.append(line)
-                print("   | " + line, flush=True)
+                # 🔴 乱码行**照样进 `lines`**（判据还要用它），只是不打到屏幕上 ——
+                #    否则 1 kHz 二进制流会把 `JUMP -> slot B` 那几行冲走。
+                if not (self.quiet_binary and not _texty(line)):
+                    print("   | " + line, flush=True)
             return None
         if (not self.buf) and (chr(b) in TOKEN_CHARS):
             return chr(b)
@@ -195,12 +275,17 @@ def pick_port():
     raise SystemExit("自动找串口失败（候选：%s），请用 --port 指定" % cand)
 
 
-def evaluate(lines, corrupt, expect_rollback=False):
+def evaluate(lines, corrupt, expect_rollback=False, silent_app=False, frames=0):
     """机器判据（不靠肉眼看）。三套：`--corrupt` 判坏包拒收 / `--expect-rollback` 判回滚 / 否则判升级成功。
 
     ⚠️ **失败路径上也要调用它** —— S7 想看的恰恰是"该失败的地方失败了"，
        不打印就等于白跑一趟（2026-10-16 第一版就踩了这个：坏帧路线提前 `return 2`，
        判据块根本没打印）。返回 True = 全部通过。
+
+    🔵 `silent_app=True`（`--silent-app`）：给 **mode 2 之类"不说话"的 App** 用的。
+       前 7 条判的是 **Bootloader** 的行为，照旧有效（BL 永远打文本）；
+       只有第 8 条"App 横幅"要换掉 —— mode 2 的 App 一句文字都没有，
+       套原文案必然假失败。换成**数二进制帧**：`frames` 由 `count_frames(dev.raw)` 传入。
     """
     if corrupt is not None:
         title = "S7/S8 判据（坏包拒收 / 重传 / 中止 / 不置标志 / 不跳坏槽）"
@@ -261,7 +346,11 @@ def evaluate(lines, corrupt, expect_rollback=False):
                                           and ("install: active_slot A -> B" in lines
                                                or "install: active_slot B -> B" in lines)),
             ("真的跳到 Slot B",            "JUMP -> slot B" in lines),
-            ("App 横幅出现（新镜像在跑）", "=== stm32-edge-ai-node boot ===" in lines),
+            # 第 8 条是**唯一**依赖"App 会说话"的一条 ⇒ `--silent-app` 时换成数帧。
+            # （第 7 条 `JUMP -> slot B` 是 Bootloader 打的，mode 2 下照样有。）
+            (("App 在跑：收到 %d 个合法二进制帧（mode 2 不打文字，改看帧）" % frames,
+              frames >= 3) if silent_app else
+             ("App 横幅出现（新镜像在跑）", "=== stm32-edge-ai-node boot ===" in lines)),
         ]
     print("\n================ %s ================" % title)
     allok = True
@@ -348,6 +437,10 @@ def main():
     ap.add_argument("--expect-rollback", action="store_true",
                     help="S8：换成「砖镜像试运行 -> 自动回滚」那套判据"
                          "（砖镜像没有 App 横幅，套升级判据必然假失败）")
+    ap.add_argument("--silent-app", action="store_true",
+                    help="不给文字输出的 App（如 APP_OUTPUT_MODE=2）用：把第 8 条"
+                         "「App 横幅」换成「收到 >=3 个合法二进制帧」。"
+                         "只影响第 8 条，其余 7 条照旧（那是 Bootloader 的行为）")
     ap.add_argument("--confirm", action="store_true",
                     help="S8：复位一次、在 2 s 窗口里发 'k' 确认当前槽（清零 trial/计数）。"
                          "正常升级完**必须**跑一次，否则复位 3 次会自动回滚")
@@ -525,10 +618,22 @@ def main():
                   % (sent, n, el, sent / 1024.0 / max(el, 1e-3)), flush=True)
 
     print("\n>> 全部发完，等设备自校验 + 复位 + 安装 ……")
+    if args.silent_app:
+        # 从这一刻起设备会：装镜像 → 复位 → Bootloader 提交 → 跳 App。
+        # mode 2 的 App 只会吐二进制帧（没有横幅、没有 LED 心跳），
+        # 所以必须**现在就开始留原始字节**，收工后拿帧解析器数一遍。
+        dev.capture_raw = True
+        dev.quiet_binary = True
     dev.drain(args.tail)
 
+    frames = count_frames(dev.raw) if args.silent_app else 0
+    if args.silent_app:
+        print("   >> 静默 App：抓到 %d 个合法二进制帧（原始字节 %.1f KB）"
+              % (frames, len(dev.raw) / 1024.0))
+
     # ---- 4) 判据（机器判，不靠肉眼看）--------------------------------
-    allok = evaluate("\n".join(dev.lines), args.corrupt, args.expect_rollback)
+    allok = evaluate("\n".join(dev.lines), args.corrupt, args.expect_rollback,
+                     args.silent_app, frames)
     if allok and args.expect_rollback:
         print("⚠️ 已回滚：active_slot 现在是 **A**，Slot B 里仍躺着那个跑不起来的镜像（没被擦，这是对的）。")
         print("   收尾必须再跑一次正常升级把 B 换回好镜像，然后 `--confirm` —— 否则以后切到 B 仍会回滚。")
