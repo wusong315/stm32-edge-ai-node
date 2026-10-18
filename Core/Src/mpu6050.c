@@ -26,8 +26,47 @@ static I2C_HandleTypeDef *s_hi2c = NULL;
  * I2C 底层读写
  * -------------------------------------------------------------------------*/
 
+/* 🔴 调用 HAL 之前先自己看 BUSY 标志（2026-10-18，修 200 ms 停顿的**真因**）。
+ *
+ * 坑的机理：F4 的 HAL 在 `HAL_I2C_Mem_Read/Write` 开头会等 BUSY 位清零，而
+ * 等待上限是 HAL 内部**写死的** `I2C_TIMEOUT_BUSY_FLAG = 25 ms`，
+ * **完全不理会我们传进去的 5 ms / 2 ms 超时**。
+ * 于是"上一笔传输被 EMI 打断、总线停在 BUSY"时，每一次尝试都要**干等 25 ms**。
+ *
+ * 实测对账（`app_ver=7`，`d100`，60 s）：6 次停顿，最坏 198 ms、期间只失败 **8** 次
+ * ⇒ 8 × 25 ms = 200 ms，**严丝合缝**。也解释了为什么把超时 5→2 ms 一点用没有
+ * （每失败成本 13.7 → 13.0 ms 不动）。
+ *
+ * 本工程是**单主机、单线程**，进到这里的时刻不可能有别人在传数据，
+ * 所以 BUSY=1 只能意味着"上一笔被打断、外设还卡在传输态"。
+ * 这时最该做的是**立刻返回失败**，让上层（`App_OnTick` 的②级）去补时钟把它解开，
+ * 而不是在 HAL 里盲等 25 ms —— 25 ms 是 25 个采样点。 */
+static HAL_StatusTypeDef mpu_wait_idle(void)
+{
+  /* ⚠️ 不能"看到 BUSY 就立刻失败"：一笔传输刚发完 STOP 时，BUSY 位还会**滞留几微秒**
+   *    （HAL 自己在下一笔开头就是靠等它清零来跨过这段）。所以先自旋等一小会儿。
+   *    2026-10-18 踩过：第一版写成"立即返回 HAL_BUSY"，结果**读全好、写全挂**
+   *    （`step=1`：紧跟在读之后的 `PWR_MGMT_1` 写被误杀），传感器再也上不了线。
+   * 取 ≈50 µs 上限：既跨得过正常的 STOP 滞留，又比 HAL 写死的 25 ms 快 500 倍。
+   * 自旋 2000 次 ≈ 2000×4 周期 / 168 MHz ≈ 48 µs。 */
+  uint32_t spin = 2000U;
+
+  while (spin-- != 0U)
+  {
+    if (__HAL_I2C_GET_FLAG(s_hi2c, I2C_FLAG_BUSY) == RESET)
+    {
+      return HAL_OK;
+    }
+  }
+  return HAL_BUSY;
+}
+
 static HAL_StatusTypeDef mpu_reg_write(uint8_t reg, uint8_t value)
 {
+  if (mpu_wait_idle() != HAL_OK)
+  {
+    return HAL_BUSY;
+  }
   return HAL_I2C_Mem_Write(s_hi2c, MPU6050_ADDR_HAL, reg,
                            I2C_MEMADD_SIZE_8BIT, &value, 1,
                            MPU6050_I2C_TIMEOUT_MS);
@@ -35,6 +74,10 @@ static HAL_StatusTypeDef mpu_reg_write(uint8_t reg, uint8_t value)
 
 static HAL_StatusTypeDef mpu_reg_read(uint8_t reg, uint8_t *buf, uint16_t len)
 {
+  if (mpu_wait_idle() != HAL_OK)
+  {
+    return HAL_BUSY;
+  }
   return HAL_I2C_Mem_Read(s_hi2c, MPU6050_ADDR_HAL, reg,
                           I2C_MEMADD_SIZE_8BIT, buf, len,
                           MPU6050_I2C_TIMEOUT_MS);
@@ -69,6 +112,18 @@ mpu6050_status_t MPU6050_WhoAmI(I2C_HandleTypeDef *hi2c, uint8_t *id)
  * 初始化
  * -------------------------------------------------------------------------*/
 
+/* 器件已被确认在线之后的那一段配置（解 SLEEP → 配采样率/带宽/量程）。
+ * ⚠️ 单独抽出来的唯一原因：冷启动（MPU6050_Init）与掉线重连（MPU6050_Reinit）
+ *    的**探测策略不同**，但配置序列必须**逐字一致**——
+ *    否则重连后器件停在别的 DLPF / 量程上，数据会静默变形，而波形看着"正常"。 */
+/* 诊断用：0 = 没失败；1..5 = mpu_configure 的第几步写挂了；6 = 探测阶段。
+ * 只在 Debug 排查时读（ST-Link / 串口打印），量产无副作用（每次失败只写一个字节）。 */
+volatile uint8_t g_mpu_fail_step = 0U;
+/* HAL 的 ErrorCode（bit1 AF / bit2 BERR / bit3 ARLO / bit8 TIMEOUT...），
+   失败时一起抓，能一眼分清"没人应答"还是"总线仲裁丢了"还是"超时"。 */
+volatile uint8_t g_mpu_fail_hal  = 0U;
+static mpu6050_status_t mpu_configure(void);
+
 mpu6050_status_t MPU6050_Init(I2C_HandleTypeDef *hi2c)
 {
   uint8_t  id    = 0;
@@ -96,9 +151,46 @@ mpu6050_status_t MPU6050_Init(I2C_HandleTypeDef *hi2c)
     return MPU6050_ERR_PROBE;   /* 接线 / 上拉 / 供电 / AD0 问题，上层报错即可 */
   }
 
+  return mpu_configure();
+}
+
+mpu6050_status_t MPU6050_Reinit(I2C_HandleTypeDef *hi2c)
+{
+  uint8_t id = 0;
+
+  if (hi2c == NULL)
+  {
+    return MPU6050_ERR_I2C;
+  }
+  s_hi2c = hi2c;
+
+  /* 🔴 只探 1 次，而且**连那 10 ms 的预延时都省掉**。
+   *    重连路径上每一毫秒都是采样点：失败就 5 ms 内给结论，
+   *    让上层按退避节奏再来，而不是在这里死等 200–300 ms。
+   *    器件此刻是真的坏还是仅仅被 EMI 打了一下，由上层用"连续失败次数"判，
+   *    不该由这一层用长延时替它扛。 */
+  if (mpu_reg_read(MPU6050_REG_WHO_AM_I, &id, 1) != HAL_OK)
+  {
+    g_mpu_fail_step = 7U;   /* 7 = 重连探测的 I2C 读本身就失败（含 BUSY 短路） */
+    return MPU6050_ERR_I2C;
+  }
+  if (id != MPU6050_WHO_AM_I_VALUE)
+  {
+    g_mpu_fail_step = 6U;
+    return MPU6050_ERR_PROBE;
+  }
+  g_mpu_fail_step = 0U;
+
+  return mpu_configure();
+}
+
+static mpu6050_status_t mpu_configure(void)
+{
   /* ---- 2. 解除休眠。上电默认 SLEEP=1，不做这一步后面读什么都是 0 ---- */
   if (mpu_reg_write(MPU6050_REG_PWR_MGMT_1, 0x00U) != HAL_OK)
   {
+    g_mpu_fail_step = 1U;
+    g_mpu_fail_hal = (uint8_t)(HAL_I2C_GetError(s_hi2c) & 0xFFU);
     return MPU6050_ERR_I2C;
   }
   HAL_Delay(10);   /* 唤醒后等内部时钟切换稳定 */
@@ -108,6 +200,8 @@ mpu6050_status_t MPU6050_Init(I2C_HandleTypeDef *hi2c)
             所以本项目的 TIM2 1kHz 采样与器件天然自洽。 ---- */
   if (mpu_reg_write(MPU6050_REG_SMPLRT_DIV, 0x00U) != HAL_OK)
   {
+    g_mpu_fail_step = 2U;
+    g_mpu_fail_hal = (uint8_t)(HAL_I2C_GetError(s_hi2c) & 0xFFU);
     return MPU6050_ERR_I2C;
   }
 
@@ -122,12 +216,16 @@ mpu6050_status_t MPU6050_Init(I2C_HandleTypeDef *hi2c)
               → 上板后**必须先用频谱验证叶频是否真的可见**，不可见的对策见 R17。 ---- */
   if (mpu_reg_write(MPU6050_REG_CONFIG, MPU6050_DLPF_CFG) != HAL_OK)
   {
+    g_mpu_fail_step = 3U;
+    g_mpu_fail_hal = (uint8_t)(HAL_I2C_GetError(s_hi2c) & 0xFFU);
     return MPU6050_ERR_I2C;
   }
 
   /* ---- 5. 量程：加速度 ±2g（AFS_SEL=0）→ 16384 LSB/g ---- */
   if (mpu_reg_write(MPU6050_REG_ACCEL_CONFIG, 0x00U) != HAL_OK)
   {
+    g_mpu_fail_step = 4U;
+    g_mpu_fail_hal = (uint8_t)(HAL_I2C_GetError(s_hi2c) & 0xFFU);
     return MPU6050_ERR_I2C;
   }
 
@@ -135,6 +233,8 @@ mpu6050_status_t MPU6050_Init(I2C_HandleTypeDef *hi2c)
             首版不做姿态解算，但先配上，免得以后回来改。 ---- */
   if (mpu_reg_write(MPU6050_REG_GYRO_CONFIG, 0x00U) != HAL_OK)
   {
+    g_mpu_fail_step = 5U;
+    g_mpu_fail_hal = (uint8_t)(HAL_I2C_GetError(s_hi2c) & 0xFFU);
     return MPU6050_ERR_I2C;
   }
 

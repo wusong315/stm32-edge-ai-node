@@ -736,6 +736,18 @@ def t_blade_peak():
           and abs(r2["blade_suggest_band"][0] - 3 * f1) < 3 * f1 * 0.13,
           "got=%r" % (r2["blade_suggest_band"],))
 
+    # 🔴 回归：verdict() 的「谐波不自洽」分支曾把 tuple 当单个数喂给 % 格式化
+    #    （TypeError: must be real number, not tuple）—— 2026-10-18 实机跑出来的。
+    #    这里直接调 verdict() 走一遍打印路径，只断言"不抛异常且真打印了建议"。
+    import io, contextlib
+    _buf = io.StringIO()
+    with contextlib.redirect_stdout(_buf):
+        _rc = cb.verdict(r2)
+    _out = _buf.getvalue()
+    check("verdict() 走谐波不自洽分支不崩，且打印出建议叶频带",
+          ("改成 --blade-band" in _out) and ("%.0f %.0f" not in _out),
+          "rc=%r tail=%r" % (_rc, _out[-100:]))
+
     # 对照：真叶频（3×）在带里 → 必须通过，且比值 ≈3
     harm3 = np.zeros((n, 3))
     harm3[:, 2] = (0.20 * np.sin(2.0 * np.pi * f1 * tk)

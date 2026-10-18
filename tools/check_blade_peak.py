@@ -625,10 +625,10 @@ def verdict(r: dict) -> int:
                   "它很可能才是真正的 1×。" % top)
             print("          → 把 --rot-band 改成覆盖它再跑一次。")
         if r["blade_suggest_band"]:
+            lo, hi = r["blade_suggest_band"]
             print("       → 按实测 1× 反推，叶频应在 %.0f Hz 附近 → "
                   "改成 --blade-band %.0f %.0f 重跑。"
-                  % (r["blade_multiple"] * (b["rot_hz"] or 0.0),
-                     r["blade_suggest_band"]))
+                  % (r["blade_multiple"] * (b["rot_hz"] or 0.0), lo, hi))
         print("       ⚠️ 叶频带下沿必须高于 2× 转频（%.0f Hz），否则 2× 总会顶替叶频。"
               % (2.0 * (b["rot_hz"] or 0.0)))
     elif r["rot_ok"]:

@@ -198,6 +198,57 @@ static volatile uint8_t   s_cmd_val   = 0U;   /* 累积到的数值 */
 static volatile uint8_t   s_cmd_digit = 0U;   /* 本行已收到几位数字（最多 3 位） */
 static volatile uint8_t   s_cmd_ready = 0U;   /* 1 = 有一整条命令待主循环处理 */
 
+/* 🔴 2026-10-18：I2C 读失败的三级处理（EMI，RISKS R23）。
+ * 背景：电机一转，电刷换向的 EMI 会让 MPU6050 偶发无应答。
+ * 实测（新电池、d100）：30.7 s 窗口里 g_sample_lost +8 870 拍（29 %）、
+ * g_frame_dropped +57 次，帧到达时间上出现 6 次 780–820 ms 的停采。
+ *
+ * 原逻辑「一次 5 ms 超时 = 判掉线」的代价太大：作废半帧 + 进退避重连。
+ * 现在的三级阶梯（每一次都只针对"该层真正能判断的事"）：
+ *   ① 连续 1–2 次失败 → 只丢这一拍（帧继续攒）；
+ *   ② 连续 3–39 次     → 仍认为传感器在线，**就地自愈**：每 8 次插一次总线恢复；
+ *   ③ 连续 40 次       → 才认账"掉线"（作废半帧 + 交给 App_EnsureSensor）。
+ *
+ * 🔴 ②这一级是 2026-10-18 加的关键修复。只做①（阈值 3 就判掉线）时，
+ *    60 s 里仍有 5 次 862–891 ms 的停顿（累计缺 4.21 s）。算账发现
+ *    最大的一块根本不是采样超时，而是**重连路径自身**：
+ *    MPU6050_Init 的探测窗口 20 ×(10 ms 延时 + 5 ms 超时) ≈ 200–300 ms，
+ *    一次失败探测 = 主循环盲等 200 ms 以上；而重连又要连续探测 2–3 次
+ *    （2×200 + 退避 10+20+40）≈ 850 ms —— 与实测的 862/891 ms 严丝合缝。
+ *    所以：① 改成用 MPU6050_Reinit（单次探测，≈5 ms）快速失败；
+ *          ② 短期抖动根本不进退避重连，就地恢复。
+ *
+ * ⚠️ 取舍（诚实记录）：跳拍会让一帧的 32 个点**跨过若干 1 ms 的空洞**，
+ *    原则上违反"不许跨空洞拼接"；但 1 ms 级的时基误差对 128 点窗口的频谱
+ *    影响可忽略，而 800 ms 级的整段缺失是致命的 —— 两害相权取其轻。
+ *    空洞仍在帧间隔信息里可见（PC 端 frame_timing 能看到 ≥3× 中位数的间隔）。 */
+#define APP_I2C_FAIL_TOLERANCE   (3U)    /* ① 之内：只丢拍 */
+#define APP_I2C_RECOVER_EVERY    (8U)    /* ② 之中：每 8 次连续失败恢复一次总线 */
+#define APP_I2C_OFFLINE_AT       (40U)   /* ③ 阈值：连续 40 次才判掉线 */
+static volatile uint8_t   s_i2c_fail  = 0U;   /* 连续读失败次数（成功即清零） */
+
+/* 掉线/恢复的量化计数器。
+ * 🔴 非 static：mode 2 下串口不许打文字，这些数是靠 ST-Link hotplug 读 RAM
+ *    看**增量**的（`-r32 <addr> <字节数>`），所以符号要在 `.elf` 里 nm 得到。
+ *    判"有没有丢"永远要找物理量，别信"校验错 0 / 序号断档 0"（已证伪两次）。 */
+uint32_t g_i2c_fail_total   = 0U;   /* 单拍读失败累计（含被 ①② 消化掉的） */
+uint32_t g_bus_recover      = 0U;   /* App_I2cBusRecover() 执行次数 */
+uint32_t g_bus_stuck        = 0U;   /* 其中真的发现 SCL/SDA 被拉死的次数 */
+uint32_t g_recon_attempts   = 0U;   /* 重连探测次数（每次 = 一次 Init/Reinit） */
+uint32_t g_offline_events   = 0U;   /* 判掉线的次数（③ 触发） */
+
+/* 「最长停顿解剖」——记录**最坏那一次**间隔里到底花在哪儿。
+ * 为什么要它：2026-10-18 实测 60 s 有 8 次 ~200 ms 停顿、108 次失败，
+ * 但按"每次失败 = 一个 I2C 超时（2 ms）"只该丢 0.2 s，实际丢了 1.41 s。
+ * 差 7 倍 ⇒ 说明**大头不在"失败这一次调用"**，必须把停顿拆开看，
+ * 否则就会靠猜去调参数（改超时 5→2 ms 已验证无效：每失败成本 13.7→13.0 ms 不变）。
+ * 读法：`-r32 0x20000964 0x18`（地址见 `_tmp\bench60.py`）。 */
+uint32_t g_gap_max_ms     = 0U;   /* 最坏停顿长度（拍 = ms） */
+uint32_t g_gap_max_fails  = 0U;   /* 该停顿内的读失败次数 */
+uint32_t g_gap_max_recover= 0U;   /* 该停顿内的总线恢复次数 */
+uint32_t g_gap_cur_fails  = 0U;   /* 下面两个是"当前这一轮"正在累计的同类量 */
+uint32_t g_gap_cur_recover= 0U;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -415,11 +466,28 @@ static void App_I2cDiag(void)
  * ⚠️ 这是"掉线重连"代码最典型的缺口：**只重试、不恢复**。
  *    现场（尤其是 OTA 之后）没有人能按复位键，一次电磁扰动就永久失联。
  *    本项目的重连必须自愈，否则"预测性维护"这个卖点不成立。 */
+/* 约微秒级的忙等（不追求精确，够用就行）。
+ * 为什么不能用 HAL_Delay：补时钟只需要 >1 µs 的电平建立时间，而 HAL_Delay(1)
+ * 最少 1 ms —— 9 个时钟 × 2 次 + 收尾 STOP 3 次 = 21 ms，是 21 个采样点。
+ * 实测（`app_ver=7`，60 s，`d100`）：6 次停顿**全部**走了补时钟分支，
+ * 光这 21 次 HAL_Delay 就占了约 140 ms，是残余停顿里仅次于 HAL 的 25 ms 盲等的第二块。
+ * 168 MHz 下 `us * 80` 次空循环 ≈ 1.9 × us 微秒（偏慢，正好留余量）。 */
+static void App_ShortDelayUs(uint32_t us)
+{
+  volatile uint32_t n = us * 80U;
+  while (n-- != 0U)
+  {
+    __NOP();
+  }
+}
+
 static void App_I2cBusRecover(void)
 {
   GPIO_InitTypeDef gi = {0};
   uint8_t          i;
   uint8_t          stuck;
+
+  g_bus_recover++;
 
   /* ① 外设级复位。
    * 用 DeInit + MX_I2C1_Init 两件套，**不能只调 MX_I2C1_Init**：
@@ -437,6 +505,8 @@ static void App_I2cBusRecover(void)
     return;                       /* 情形 ① 已解决，不用补时钟 */
   }
 
+  g_bus_stuck++;
+
   /* ③ 补时钟：把 SCL/SDA 临时切成开漏输出，手动打脉冲。 */
   gi.Pin   = GPIO_PIN_6 | GPIO_PIN_7;
   gi.Mode  = GPIO_MODE_OUTPUT_OD;
@@ -446,14 +516,14 @@ static void App_I2cBusRecover(void)
 
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);    /* 先释放 SDA */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
-  HAL_Delay(1);
+  App_ShortDelayUs(5U);
 
   for (i = 0U; i < 9U; i++)
   {
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
-    HAL_Delay(1);
+    App_ShortDelayUs(5U);
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
-    HAL_Delay(1);
+    App_ShortDelayUs(5U);
     if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_SET)
     {
       break;                      /* 从机已释放 SDA，不必再补 */
@@ -462,11 +532,11 @@ static void App_I2cBusRecover(void)
 
   /* ④ 补一个 STOP：SCL 高电平时把 SDA 由低拉高。 */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
-  HAL_Delay(1);
+  App_ShortDelayUs(5U);
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
-  HAL_Delay(1);
+  App_ShortDelayUs(5U);
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);
-  HAL_Delay(1);
+  App_ShortDelayUs(5U);
 
   /* ⑤ 引脚交还 I2C 外设（同样走 DeInit + Init，理由见 ①）。 */
   (void)HAL_I2C_DeInit(&hi2c1);
@@ -521,6 +591,7 @@ static void App_EnsureSensor(void)
   static uint32_t s_last      = 0U;
   static uint32_t s_backoff   = 0U;   /* 下一次重试要等几拍（0 = 首次） */
   uint32_t wait;
+  uint8_t  cold;                      /* 1 = 本次是上电后的第一次探测 */
   mpu6050_status_t st;
 
   if (g_sensor_ok != 0U)
@@ -533,6 +604,7 @@ static void App_EnsureSensor(void)
   {
     return;
   }
+  cold    = s_first;
   s_first = 0U;
   s_last  = g_tick;
   s_backoff = (wait >= 100U) ? 200U : (wait * 2U);
@@ -541,7 +613,12 @@ static void App_EnsureSensor(void)
     s_backoff = 200U;
   }
 
-  st = MPU6050_Init(&hi2c1);
+  /* 🔴 冷启动用 MPU6050_Init（20 次探测，上电后器件可能要 >100 ms 才应答）；
+   *    掉线重连用 MPU6050_Reinit（**只探 1 次**）。
+   *    差别是 200–300 ms 的盲等 —— 实测它就是 862/891 ms 停采的主项，
+   *    详见 APP_I2C_FAIL_TOLERANCE 上方那段算账。 */
+  g_recon_attempts++;
+  st = (cold != 0U) ? MPU6050_Init(&hi2c1) : MPU6050_Reinit(&hi2c1);
   if (st == MPU6050_OK)
   {
     g_sensor_ok = 1U;
@@ -558,8 +635,10 @@ static void App_EnsureSensor(void)
     {
       uint8_t id = 0U;
       (void)MPU6050_WhoAmI(&hi2c1, &id);   /* 顺便把实际读到的 id 打出来 */
-      printf("[WAIT] MPU6050 not found (id=0x%02X). Check wiring: "
-             "VCC=3V3 GND SDA=PB7 SCL=PB6 AD0=GND\r\n", (unsigned)id);
+      printf("[WAIT] MPU6050 not found (id=0x%02X, st=%u step=%u err=0x%02X). "
+             "Check wiring: VCC=3V3 GND SDA=PB7 SCL=PB6 AD0=GND\r\n",
+             (unsigned)id, (unsigned)st, (unsigned)g_mpu_fail_step,
+             (unsigned)g_mpu_fail_hal);
     }
 
     if ((s_diag_done == 0U) && (App_TextAllowed() != 0U))
@@ -695,9 +774,38 @@ static void App_OnTick(void)
    * 带宽：198 字节/帧 × 31.25 帧/s ≈ 6.2 KB/s < 11.5 KB/s，留有余量。 */
   {
     mpu6050_accel_raw_t raw;
+    static uint32_t     s_ok_tick = 0U;   /* 上一次**成功采样**的时刻（解剖停顿用） */
 
     if (MPU6050_ReadAccel(&raw) != MPU6050_OK)
     {
+      /* 三级阶梯，见 APP_I2C_FAIL_TOLERANCE 上方的整段说明。 */
+      g_i2c_fail_total++;
+      g_gap_cur_fails++;
+      s_i2c_fail++;
+
+      /* ① 抖动：只丢这一拍，帧继续攒 */
+      if (s_i2c_fail < APP_I2C_FAIL_TOLERANCE)
+      {
+        return;
+      }
+
+      /* ② 传感器仍算在线，就地自愈 —— 每 8 次连续失败恢复一次总线。
+       *    为什么敢就地恢复：App_I2cBusRecover() 在不"卡死"的常态下
+       *    只做 DeInit+Init 加两次引脚读，几十微秒就返回；
+       *    真正要补 9 个时钟时说明从机确实被钉住，那时更该补。 */
+      if (s_i2c_fail < APP_I2C_OFFLINE_AT)
+      {
+        if ((s_i2c_fail % APP_I2C_RECOVER_EVERY) == 0U)
+        {
+          g_gap_cur_recover++;
+          App_I2cBusRecover();
+        }
+        return;
+      }
+
+      /* ③ 连续 40 次仍不应答 → 认账掉线，交给 App_EnsureSensor 走退避重连 */
+      s_i2c_fail = 0U;
+      g_offline_events++;
       g_sensor_ok = 0U;
       /* 🔴 必须把已经攒了一半的帧**作废**。
        *    不作废的话，等传感器重连回来会接着往同一帧里塞：
@@ -711,6 +819,24 @@ static void App_OnTick(void)
       }
       return;
     }
+    s_i2c_fail = 0U;
+
+    /* 「停顿解剖」：每次成功采样时结算上一轮间隔，只记录最坏那一次。
+     * 间隔用 g_tick 差值（1 拍 = 1 ms）而不是 HAL_GetTick —— 两者同源，
+     * 但 g_tick 就是采样时基本身，口径与 g_sample_lost 完全一致。 */
+    {
+      uint32_t gap = g_tick - s_ok_tick;
+      if (gap > g_gap_max_ms)
+      {
+        g_gap_max_ms      = gap;
+        g_gap_max_fails   = g_gap_cur_fails;
+        g_gap_max_recover = g_gap_cur_recover;
+      }
+      s_ok_tick         = g_tick;
+      g_gap_cur_fails   = 0U;
+      g_gap_cur_recover = 0U;
+    }
+
     g_frame_ax[g_frame_idx] = raw.ax;
     g_frame_ay[g_frame_idx] = raw.ay;
     g_frame_az[g_frame_idx] = raw.az;
