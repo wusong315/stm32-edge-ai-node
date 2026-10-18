@@ -58,6 +58,46 @@ static float NEAI_CyclesToUs(uint32_t cycles)
   return ((float)cycles * 1000000.0f) / (float)HAL_RCC_GetHCLKFreq();
 }
 
+#if (APP_NEAI_REMOVE_DC != 0)
+/* 逐窗去直流：一窗内每轴的均值减掉。
+ *
+ * 🔴 必须是"填满整窗后两遍扫描"，不能改成逐点高通滤波器：
+ *    PC 端 `to_neai_csv.py` 做的是 `seg - seg.mean(axis=1)`，只有两遍扫描
+ *    与它**逐元素等价**；换成 IIR 高通就是另一个滤波器，训练与推理会不一致。
+ *
+ * 代价：每 128 ms 做 3×(128 加 + 128 减) ≈ 768 次浮点操作，相对 1 kHz 采样可忽略。
+ * 布局：两种排列都要处理（AXIS_MAJOR=1 连续段；=0 跨步取）。 */
+static void NEAI_RemoveWindowDc(float *buf)
+{
+  uint16_t axis, i;
+
+  for (axis = 0U; axis < (uint16_t)NEAI_NUM_AXES; axis++)
+  {
+    float sum = 0.0f;
+    float mean;
+
+#if (APP_NEAI_AXIS_MAJOR != 0)
+    {
+      float *p = &buf[(uint32_t)axis * NEAI_WIN_SAMPLES];
+      for (i = 0U; i < (uint16_t)NEAI_WIN_SAMPLES; i++) { sum += p[i]; }
+      mean = sum / (float)NEAI_WIN_SAMPLES;
+      for (i = 0U; i < (uint16_t)NEAI_WIN_SAMPLES; i++) { p[i] -= mean; }
+    }
+#else
+    for (i = 0U; i < (uint16_t)NEAI_WIN_SAMPLES; i++)
+    {
+      sum += buf[((uint32_t)i * NEAI_NUM_AXES) + axis];
+    }
+    mean = sum / (float)NEAI_WIN_SAMPLES;
+    for (i = 0U; i < (uint16_t)NEAI_WIN_SAMPLES; i++)
+    {
+      buf[((uint32_t)i * NEAI_NUM_AXES) + axis] -= mean;
+    }
+#endif
+  }
+}
+#endif
+
 /* 记一次错误：非 OK 返回码绝不静默丢弃 */
 static void NEAI_NoteError(enum neai_state st)
 {
@@ -148,6 +188,12 @@ uint8_t NEAI_AppPushSample(const float *axis_g)
     return NEAI_PUSH_NONE;                 /* 窗口还没攒满 */
   }
   s_fill = 0U;                             /* 攒满 → 把这块缓冲整个交给库 */
+
+#if (APP_NEAI_REMOVE_DC != 0)
+  /* 🔴 必须在 learn/detect **之前**、整窗填满**之后**：两遍扫描去均值，
+   *    与 PC 端训练集的口径逐元素等价（见 neai_app.h 里 APP_NEAI_REMOVE_DC 的说明）。*/
+  NEAI_RemoveWindowDc(s_buf);
+#endif
 
   /* ---- 2) 学习阶段 ------------------------------------------------ */
   if (s_st.learn_calls < APP_NEAI_LEARN_TARGET)
