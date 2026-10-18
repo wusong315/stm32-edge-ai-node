@@ -677,7 +677,11 @@ def build_argparser() -> argparse.ArgumentParser:
                         % (DEFAULT_BLADE_MULTIPLE, DEFAULT_BLADE_BAND[0], DEFAULT_BLADE_BAND[1]))
     p.add_argument("--rot-band", type=float, nargs=2,
                    default=None, metavar=("LO", "HI"),
-                   help="转频搜索带 Hz，默认 %g %g" % DEFAULT_ROT_BAND)
+                   help=("转频搜索带 Hz，默认 %g %g。🔴 本机实测工作点会在 **40–87 Hz** "
+                         "之间漂（电池/负载不同），默认带是按旧工作点定的 ⇒ 跑完**必须看"
+                         "『全谱前 5 个峰』那一段**：若最强峰在带外，它很可能才是真正的 1×，"
+                         "按提示改这一带重跑（实例：默认带会把 218.8 Hz 的 3× 误当 1×，"
+                         "结论从『通过』翻成『不通过』）" % DEFAULT_ROT_BAND)))
     p.add_argument("--blade-multiple", type=float,
                    default=DEFAULT_BLADE_MULTIPLE, metavar="K",
                    help="叶频 = K × 转频，默认 %g（3 叶桨）；用于谐波自洽校验"
