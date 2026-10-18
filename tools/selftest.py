@@ -29,6 +29,7 @@ import check_blade_peak as cb
 import pwm_sweep as ps
 import check_pwm_cmd as cpc
 import calib_dev as cd
+import to_neai_csv as nc
 
 _fail = 0
 _pass = 0
@@ -1437,6 +1438,67 @@ def t_serial_pacing():
           made and made[0][1].get("timeout") == 0.2, made[:1])
 
 
+def t_neai_csv():
+    """Studio 转换：维度、两种布局、去直流 —— 三条都必须能被证伪。"""
+    print("\n[22] to_neai_csv：连续序列 → 每行一个信号（Studio 导入格式）")
+    import contextlib
+    import io as _io
+    import os
+    import sys as _sys
+    import tempfile
+
+    N, W = 500, 64
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "seq.csv")
+        t = np.arange(N) / 1000.0
+        k = np.arange(N)
+        # 三轴给不同直流 + 缓慢斜坡：这样"哪一段是哪一轴"可以被逐元素验证
+        ax, ay, az = 1.0 + 1e-3 * k, 2.0 + 1e-3 * k, 3.0 + 1e-3 * k
+        np.savetxt(src, np.column_stack([t, ax, ay, az]), delimiter=",",
+                   header="t_s,ax_g,ay_g,az_g", comments="")
+
+        def run(argv):
+            old = _sys.argv
+            _sys.argv = ["to_neai_csv.py"] + argv
+            try:
+                with contextlib.redirect_stdout(_io.StringIO()):
+                    return nc.main()
+            except SystemExit as e:
+                return e.code if isinstance(e.code, int) else 1
+            finally:
+                _sys.argv = old
+
+        out = os.path.join(d, "train.csv")
+        rc = run(["--in", src, "--out", out, "--window", str(W), "--keep-dc"])
+        check_eq("转换退出码 0", rc, 0)
+        m = np.loadtxt(out, delimiter=",", ndmin=2)
+        check_eq("窗口数 = 500 // 64 = 7", m.shape[0], 7)
+        check_eq("每行 3×窗长 = 192 列", m.shape[1], 3 * W)
+        check("axis-major 第一段是 ax", np.allclose(m[0, :W], ax[:W], atol=1e-5),
+              "%.6f vs %.6f" % (m[0, 0], ax[0]))
+        check("axis-major 第二段是 ay", np.allclose(m[0, W:2 * W], ay[:W], atol=1e-5))
+        check("axis-major 第三段是 az", np.allclose(m[0, 2 * W:], az[:W], atol=1e-5))
+
+        out2 = os.path.join(d, "pm.csv")
+        rc2 = run(["--in", src, "--out", out2, "--window", str(W),
+                   "--layout", "point-major", "--keep-dc"])
+        check_eq("point-major 退出码 0", rc2, 0)
+        m2 = np.loadtxt(out2, delimiter=",", ndmin=2)
+        check_eq("point-major 列数不变", m2.shape[1], 3 * W)
+        check("point-major 是 x0,y0,z0", np.allclose(m2[0, :3], [ax[0], ay[0], az[0]], atol=1e-5))
+
+        out3 = os.path.join(d, "dc.csv")
+        run(["--in", src, "--out", out3, "--window", str(W)])
+        m3 = np.loadtxt(out3, delimiter=",", ndmin=2)
+        means = [abs(float(m3[:, j * W:(j + 1) * W].mean())) for j in range(3)]
+        check("默认去直流：三轴窗均值都 ≈ 0", max(means) < 1e-6, str(means))
+        check("去直流没把信号抹掉（σ 仍 > 0）", float(m3.std()) > 1e-4, "%.2e" % m3.std())
+
+        rc4 = run(["--in", src, "--out", os.path.join(d, "x.csv"), "--window", str(N + 1)])
+        check("窗长超过总点数时报错退出（不写空文件）", rc4 != 0, "rc=%r" % rc4)
+        check("此时没有留下空产物", not os.path.isfile(os.path.join(d, "x.csv")))
+
+
 def main() -> int:
     print("=" * 68)
     print("stm32-edge-ai-node · PC 端数据链路自测（不需要硬件）")
@@ -1462,6 +1524,7 @@ def main() -> int:
     t_pwm_cmd()
     t_calib()
     t_serial_pacing()
+    t_neai_csv()
 
     print("\n" + "=" * 68)
     print("结果：%d 通过 / %d 失败" % (_pass, _fail))

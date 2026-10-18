@@ -35,7 +35,8 @@ D:\STM32Projects\pc-venv\Scripts\python.exe
 | `watch.cmd` | **双击即可**的启动器 → `calib_dev.py --watch`（串口自动挑；`.cmd` 内**故意只用 ASCII**，中文输出全由 Python 负责） |
 | `ota_send.py` | **串口升级（OTA / `S6`）**：把一份 `.bin` 分包灌进 **Bootloader 的 Slot B**，停等重传 + 全程打印设备日志 + **升级后自动判定 8 条判据**；`--selftest` 帧格式固定向量、`--dry-run` 只算不发、`--corrupt N` 造坏帧（给 `S7`/`S8`）、`--expect-rollback` 换回滚判据、`--confirm` 发 `k` 确认、**`--silent-app` 换"数二进制帧"判据（给 mode 2/3 这种不打字的 App）**、`--stlink-reset` 省得手按 RESET |
 | `bench_stall.py` | **采集健康度门禁**：帧间隔停顿 + 固件计数器增量**一次原子测量**（把「读数→采 60 s→读数」绑成同一次，避免拿两次不同采集的数字对比）；判据 = 停顿 0 次 / 完整度 ≥99.5 % / 掉线 0；`--print-addrs` 列出所需的 RAM 符号地址 |
-| `selftest.py` | **自测**：318 条断言，不需要硬件 |
+| `to_neai_csv.py` | **Studio 导入格式转换**：把连续序列 CSV 切成「**每行一个信号**」（列 = 窗长 × 3 轴），默认按轴拼接 + **去掉每轴直流**（直流由装夹角度决定、比振动大两个数量级）。`--layout point-major` / `--unit lsb` / `--keep-dc` 三个开关对齐 Studio 的约定；`--dry-run` 先看窗数与形态，`--verify` 写完读回逐元素比对；产物旁自动落 `*.manifest.json` |
+| `selftest.py` | **自测**：331 条断言，不需要硬件 |
 
 ## 先跑自测（每次改完代码都该跑）
 
