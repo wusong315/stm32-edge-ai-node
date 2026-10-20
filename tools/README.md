@@ -804,3 +804,50 @@ PC 端无法可靠解析。用 `--text` 对应档 0/1，不加则对应档 2。
 2. **端口**：`--list-ports` 确认选对了
 3. **波特率**：是否 115200
 4. **模式**：固件 `APP_OUTPUT_MODE` 与解析方式是否一致（二进制用默认，文本加 `--text`）
+
+## `iotda_probe.py` — 华为云 IoTDA 明文 1883 连通性探针
+
+**用途**：`T10` 上云。在 ESP8266 还没到的时候，**用 PC 当设备**先把云侧打穿。
+同时它输出的**报文逐字节十六进制就是 STM32 端 C 实现必须拼出的一模一样的字节**。
+
+**零依赖**：只用 `socket` / `hmac` / `hashlib`，不装 `paho-mqtt`（本机装包要先摘代理）。
+
+**为什么自己拼报文**：MQTT 3.1.1 的 CONNECT 就十来个字节，拼一遍比装库更能对上 STM32 的实现；
+而且拼错了会立刻在 `CONNACK` 返回码上现形。
+
+```bash
+# 离线自测（13 条断言：变长编码边界 + CONNECT 固定向量 + 鉴权拼装）
+python tools/iotda_probe.py --selftest
+
+# 只生成三要素 + 打印报文（不联网）
+python tools/iotda_probe.py --device-id <id> --secret <secret> --hex
+
+# 真连，自动测出 HMAC key/msg 顺序的真值
+python tools/iotda_probe.py --host <xxx>.st1.iotda-device.cn-north-4.myhuaweicloud.com \
+       --device-id <id> --secret <secret> --auto
+
+# 连上后发一条 properties/report
+python tools/iotda_probe.py --host ... --device-id <id> --secret <secret> \
+       --publish --service-id vibration --similarity 42
+```
+
+### 鉴权公式（官方口径）
+
+| 字段 | 值 |
+|---|---|
+| `ClientId` | `{device_id}_0_{sig_type}_{ts}`，`sig_type`：0 不校验时间戳 / 1 校验 |
+| `Username` | `device_id` |
+| `Password` | `HMAC-SHA256` 的小写十六进制 |
+| `ts` | **UTC** `YYYYMMDDHH` |
+
+⚠️ **明文 MQTT 平台也强制校验时间戳** ⇒ `ts` 必须是当前 UTC 小时。
+⚠️ 中英文文档对 HMAC 的 key/msg 顺序表述不一致 ⇒ 用 `--auto` 让返回码定真值，别猜。
+
+### 返回码
+
+| rc | 含义 | 常见原因 |
+|---|---|---|
+| `0x00` | 连接成功 | — |
+| `0x02` | clientId 格式错 / 心跳不合法 | ClientId 少了 `_0_0_` 段 |
+| `0x04` | 用户名或密码错 | **`ts` 不是当前 UTC 小时**、secret 被重置过 |
+| `0x05` | 未授权 | 设备没注册到该实例 |
