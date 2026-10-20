@@ -21,13 +21,40 @@
 #define __NEAI_APP_H__
 
 #include <stdint.h>
+#include <stdbool.h>
 
-/* 取库的尺寸宏（AXIS_NUMBER / DATA_INPUT_USER / NEAI_ID / MINIMUM_ITERATION_...） */
+/* 取库的尺寸宏 */
 #include "NanoEdgeAI.h"
+
+/* ---------------------------------------------------------------------------
+ * 🔴 库宏的**跨版本适配**（2026-10-19 换真库时实测踩到，两个版本名字不同）
+ *
+ *   NanoEdge AI Studio 4.x：`AXIS_NUMBER` / `DATA_INPUT_USER`
+ *                           + `MINIMUM_ITERATION_CALLS_FOR_EFFICIENT_LEARNING`
+ *                           + `init(void)` / `set_sensitivity()`
+ *   NanoEdge AI Studio 5.x：`NEAI_INPUT_AXIS_NUMBER` / `NEAI_INPUT_SIGNAL_LENGTH`
+ *                           没有 MIN_ITERATION 宏 —— **改由 learn() 返回
+ *                           `NEAI_LEARNING_DONE` 告知"学够了"**
+ *                           `init(bool use_pretrained)`，且**没有 set_sensitivity**
+ *
+ * 两代各映射一次 ⇒ 换库仍然只换 `NanoEdgeAI.h` + `libneai.a` 两个文件，
+ * 本层与 `main.c` 一行都不用改（这正是 `neai_app.h` 从第一天起的设计目标）。
+ * ------------------------------------------------------------------------- */
+#if defined(NEAI_INPUT_AXIS_NUMBER) && defined(NEAI_INPUT_SIGNAL_LENGTH)
+#  define NEAI_LIB_AXES                 (NEAI_INPUT_AXIS_NUMBER)
+#  define NEAI_LIB_WIN                  (NEAI_INPUT_SIGNAL_LENGTH)
+#  define NEAI_LIB_TELLS_WHEN_DONE      (1)    /* 5.x：靠 learn() 返回值判断 */
+#  define NEAI_INIT_ARGS()              ((bool)APP_NEAI_USE_PRETRAINED)
+#else
+#  define NEAI_LIB_AXES                 (AXIS_NUMBER)
+#  define NEAI_LIB_WIN                  (DATA_INPUT_USER)
+#  define NEAI_LIB_TELLS_WHEN_DONE      (0)    /* 4.x：只有宏，得自己数 */
+#  define NEAI_INIT_ARGS()              /* 4.x 的 init 无参 */
+#endif
 
 /* 对外暴露"当前模型要几个轴" —— 这样 main.c 不必自己去 include 库头文件，
  * 也就不会有人不小心把尺寸写死成 3。 */
-#define NEAI_APP_NUM_AXES               (AXIS_NUMBER)
+#define NEAI_APP_NUM_AXES               (NEAI_LIB_AXES)
 
 /* ---------------------------------------------------------------------------
  * 编译期开关：0 = NanoEdge 完全退出（退化成纯采集工程，用于定位"到底是不是 AI 的锅"）
@@ -37,12 +64,23 @@
 #define APP_NEAI_ENABLE                 (1)
 #endif
 
-/* 学习阶段要喂多少个窗口才转入推理。
- * 🔴 必须 >= 库里的 MINIMUM_ITERATION_CALLS_FOR_EFFICIENT_LEARNING（占位库为 25）。
- *    本项目口径（DECISIONS D18）：取 Studio 给的最小迭代数的 4~5 倍 → 40~50。
- *    换库后按 Studio 生成时给出的建议值改这里。 */
+/* 学习阶段的**上限**（注意：不是"目标次数"了）
+ *
+ * 🔴 语义在换 5.x 库时变了（2026-10-19）：
+ *    5.x 的 `learn()` 自己会返回 `NEAI_LEARNING_DONE` —— 库说学够了就学够了，
+ *    **不再需要我们去猜"该学多少次"**（旧版的 MIN_ITERATION 宏在 5.x 里已不存在）。
+ *    所以本宏降级为**防死循环的硬上限**。实测参考：本库（ICM，128 点 × 3 轴）
+ *    在 **290 次**左右返回 DONE ⇒ 290 × 0.128 s ≈ **37 s** 上板学习时间。
+ *    4.x 老库没有这个返回值，那时它仍是"目标次数"（`D18` 的 4~5 倍口径）。 */
 #ifndef APP_NEAI_LEARN_TARGET
-#define APP_NEAI_LEARN_TARGET           (40U)
+#define APP_NEAI_LEARN_TARGET           (1000U)
+#endif
+
+/* `init()` 的参数：true = 直接使用 Studio 训练好的模型（本项目就是要这个；
+ * 因为我们训练集是 2780 窗真实数据，片上再学只是"补一点本机差异"）。
+ * 设 0 才是从零开始学 —— 那需要喂几千窗，今晚不采用。 */
+#ifndef APP_NEAI_USE_PRETRAINED
+#define APP_NEAI_USE_PRETRAINED         (1)
 #endif
 
 /* 打印节流：每 N 次 learn / detect 事件才往串口打一行（1 = 每次都打）。

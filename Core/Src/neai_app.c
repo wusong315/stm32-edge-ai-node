@@ -15,15 +15,14 @@
 #include <string.h>
 #include <stdio.h>
 
-/* 从库宏换算出本层的三个尺寸（改库自动跟着变） */
-#define NEAI_NUM_AXES    (AXIS_NUMBER)
-#define NEAI_WIN_SAMPLES (DATA_INPUT_USER)                 /* 一个窗口含多少个采样点 */
-#define NEAI_BUF_FLOATS  (DATA_INPUT_USER * AXIS_NUMBER)   /* 交给库的 float 数组总长度 */
+/* 从库宏换算出本层的三个尺寸（改库自动跟着变；跨版本的映射见 neai_app.h） */
+#define NEAI_NUM_AXES    (NEAI_LIB_AXES)
+#define NEAI_WIN_SAMPLES (NEAI_LIB_WIN)                    /* 一个窗口含多少个采样点 */
+#define NEAI_BUF_FLOATS  (NEAI_LIB_WIN * NEAI_LIB_AXES)    /* 交给库的 float 数组总长度 */
 
-/* 编译期挡住"学习次数设得比库要求还少"这种错误（负长度数组必编译失败）。
- * 比 #warning 更硬：这种配置错误不该等到看日志才发现。 */
-typedef char NEAI_learn_target_check
-    [(APP_NEAI_LEARN_TARGET >= MINIMUM_ITERATION_CALLS_FOR_EFFICIENT_LEARNING) ? 1 : -1];
+/* 编译期挡住"尺寸离谱"的配置错误（负长度数组必编译失败），比看日志早得多。
+ * 🔴 5.x 库已不再提供 MINIMUM_ITERATION 宏，所以这里改成守尺寸而不是守学习次数。 */
+typedef char NEAI_win_size_check[(NEAI_WIN_SAMPLES >= 16) ? 1 : -1];
 
 #if (APP_NEAI_ENABLE != 0)
 
@@ -33,20 +32,25 @@ typedef char NEAI_learn_target_check
 static float            s_buf[NEAI_BUF_FLOATS];  /* 交给库的输入缓冲区（axis-major 默认） */
 static uint16_t         s_fill  = 0U;            /* 当前窗口已填采样点数 */
 static uint8_t          s_ready = 0U;            /* init() 成功才置 1 */
+static uint8_t          s_not_ready_hinted = 0U; /* "detect 说还得学"只提示一次，避免刷屏 */
 static neai_app_stats_t s_st;                    /* 统计（供串口心跳与 Live Watch） */
 
-/* 库返回码 → 可读名字，日志里直接看得懂 */
+/* 库返回码 → 可读名字，日志里直接看得懂。
+ * 🔴 枚举成员在 5.x 里换了一整套（旧版是 INIT_FCT_NOT_CALLED / BOARD_ERROR /
+ *    KNOWLEDGE_BUFFER_ERROR / NOT_ENOUGH_CALL_TO_LEARNING / MINIMAL_RECOMMENDED_LEARNING_DONE），
+ *    所以这里的 switch 必须跟着库头文件走 —— 这是"换库"时唯一必须改的代码位置。 */
 static const char *NEAI_StateName(enum neai_state st)
 {
   switch (st)
   {
-    case NEAI_OK:                                return "OK";
-    case NEAI_INIT_FCT_NOT_CALLED:               return "INIT_NOT_CALLED";
-    case NEAI_BOARD_ERROR:                       return "BOARD_ERROR";
-    case NEAI_KNOWLEDGE_BUFFER_ERROR:            return "KNOWLEDGE_BUFFER_ERROR";
-    case NEAI_NOT_ENOUGH_CALL_TO_LEARNING:       return "NOT_ENOUGH_CALL_TO_LEARNING";
-    case NEAI_MINIMAL_RECOMMENDED_LEARNING_DONE: return "MINIMAL_RECOMMENDED_LEARNING_DONE";
-    default:                                     return "UNKNOWN_ERROR";
+    case NEAI_OK:                    return "OK";
+    case NEAI_ERROR:                 return "ERROR";
+    case NEAI_NOT_INITIALIZED:       return "NOT_INITIALIZED";
+    case NEAI_INVALID_PARAM:         return "INVALID_PARAM";
+    case NEAI_NOT_SUPPORTED:         return "NOT_SUPPORTED";
+    case NEAI_LEARNING_DONE:         return "LEARNING_DONE";
+    case NEAI_LEARNING_IN_PROGRESS:  return "LEARNING_IN_PROGRESS";
+    default:                         return "UNKNOWN_STATE";
   }
 }
 
@@ -113,6 +117,7 @@ void NEAI_AppReset(void)
   s_st.min_similarity = 100U;   /* 最小值从 100 往下收 */
   s_fill  = 0U;
   s_ready = 0U;
+  s_not_ready_hinted = 0U;
 }
 
 void NEAI_AppInit(void)
@@ -128,21 +133,36 @@ void NEAI_AppInit(void)
   KIN1_ResetCycleCounter();
 
   /* 🔴 这一行是"到底链上了哪个库"的铁证：换库后 NEAI_ID 必须跟着变。
-   *    若这里的 ID 还是 62e147... 就说明占位库没被换掉。 */
-  printf("[NEAI] lib linked: ID=%s AXIS=%u WIN=%u MIN_ITER=%u\r\n",
+   *    （占位库是 62e147...，2026-10-19 换成的真库是 6ad5fc07...） */
+  printf("[NEAI] lib linked: ID=%s AXIS=%u WIN=%u\r\n",
          NEAI_ID,
          (unsigned)NEAI_NUM_AXES,
-         (unsigned)NEAI_WIN_SAMPLES,
-         (unsigned)MINIMUM_ITERATION_CALLS_FOR_EFFICIENT_LEARNING);
+         (unsigned)NEAI_WIN_SAMPLES);
 
-  st = neai_anomalydetection_init();
+  /* 🔴 自洽性判据（可证伪）：**库自己报**的尺寸必须等于头文件里的宏。
+   *    不等 ⇒ 这个 `.a` 和这个 `.h` 不是同一次导出的（"换了库忘了换头文件"
+   *    最典型的症状，而且后面所有推理都会因为尺寸错位而毫无意义）。 */
+  if (((int)NEAI_WIN_SAMPLES != neai_get_input_signal_size()) ||
+      ((int)NEAI_NUM_AXES    != neai_get_axis_number()))
+  {
+    printf("[NEAI] *** SIZE MISMATCH: header %ux%u vs library %dx%d\r\n",
+           (unsigned)NEAI_NUM_AXES, (unsigned)NEAI_WIN_SAMPLES,
+           neai_get_axis_number(), neai_get_input_signal_size());
+  }
+  else
+  {
+    printf("[NEAI] size self-check OK (lib reports %d x %d)\r\n",
+           neai_get_axis_number(), neai_get_input_signal_size());
+  }
+
+  st = neai_anomalydetection_init NEAI_INIT_ARGS();
   if (st == NEAI_OK)
   {
     s_ready         = 1U;
     s_st.initialized = 1U;
-    printf("[NEAI] init OK. learn target=%u windows, sensitivity=%.2f\r\n",
-           (unsigned)APP_NEAI_LEARN_TARGET,
-           (double)neai_anomalydetection_get_sensitivity());
+    printf("[NEAI] init OK. pretrained=%u, learn cap=%u windows\r\n",
+           (unsigned)APP_NEAI_USE_PRETRAINED,
+           (unsigned)APP_NEAI_LEARN_TARGET);
   }
   else
   {
@@ -196,23 +216,23 @@ uint8_t NEAI_AppPushSample(const float *axis_g)
 #endif
 
   /* ---- 2) 学习阶段 ------------------------------------------------ */
-  if (s_st.learn_calls < APP_NEAI_LEARN_TARGET)
+  if (s_st.learned_enough == 0U)
   {
     st = neai_anomalydetection_learn(s_buf);
     s_st.learn_calls++;
 
-    if (st == NEAI_MINIMAL_RECOMMENDED_LEARNING_DONE)
+    if (st == NEAI_LEARNING_DONE)
     {
-      /* 这不是错误：库在提示"已经学够了"，可以提前转入推理 */
+      /* 5.x 的"学够了"信号 —— 不是错误，是库叫我们转入推理。
+       * 这个比任何"猜次数"都可靠：旧版只能拿 MIN_ITERATION 宏 ×4~5 去估。 */
       s_st.learned_enough = 1U;
-      if ((s_st.learn_calls % APP_NEAI_PRINT_DECIM) == 0U)
-      {
-        printf("[NEAI] learn %u/%u -> library says: enough learning\r\n",
-               (unsigned)s_st.learn_calls, (unsigned)APP_NEAI_LEARN_TARGET);
-      }
+      printf("[NEAI] learn %u -> library says LEARNING_DONE, switching to DETECT\r\n",
+             (unsigned)s_st.learn_calls);
       return NEAI_PUSH_LEARNED;
     }
-    if (st != NEAI_OK)
+
+    /* NEAI_OK / NEAI_LEARNING_IN_PROGRESS 都算"还在学"（不同版本返回不同） */
+    if ((st != NEAI_OK) && (st != NEAI_LEARNING_IN_PROGRESS))
     {
       NEAI_NoteError(st);
       return NEAI_PUSH_ERROR;
@@ -220,14 +240,16 @@ uint8_t NEAI_AppPushSample(const float *axis_g)
 
     if (s_st.learn_calls >= APP_NEAI_LEARN_TARGET)
     {
+      /* 兜底：库一直不说 DONE 也不能永远学下去，否则永远出不了相似度 */
       s_st.learned_enough = 1U;
-      printf("[NEAI] learning done (%u windows). switching to DETECT mode.\r\n",
+      printf("[NEAI] learn cap %u reached without LEARNING_DONE -> DETECT anyway\r\n",
              (unsigned)s_st.learn_calls);
     }
     else if ((s_st.learn_calls % APP_NEAI_PRINT_DECIM) == 0U)
     {
-      printf("[NEAI] learn %u/%u\r\n",
-             (unsigned)s_st.learn_calls, (unsigned)APP_NEAI_LEARN_TARGET);
+      printf("[NEAI] learn %u/%u (%s)\r\n",
+             (unsigned)s_st.learn_calls, (unsigned)APP_NEAI_LEARN_TARGET,
+             NEAI_StateName(st));
     }
     return NEAI_PUSH_LEARNED;
   }
@@ -241,6 +263,19 @@ uint8_t NEAI_AppPushSample(const float *axis_g)
     KIN1_ResetCycleCounter();
     st = neai_anomalydetection_detect(s_buf, &sim);
     cycles = KIN1_GetCycleCounter();
+
+    if (st == NEAI_LEARNING_IN_PROGRESS)
+    {
+      /* 库说"还得再学" —— **不是错误**，别记进 error_count，也别刷屏。
+       * 只在第一次提示一句，之后每窗继续尝试（学够了自然就 OK 了）。 */
+      if (s_not_ready_hinted == 0U)
+      {
+        s_not_ready_hinted = 1U;
+        printf("[NEAI] detect says LEARNING_IN_PROGRESS (learned %u windows so far)\r\n",
+               (unsigned)s_st.learn_calls);
+      }
+      return NEAI_PUSH_NONE;
+    }
 
     if (st != NEAI_OK)
     {
