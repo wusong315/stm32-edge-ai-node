@@ -873,3 +873,31 @@ PUBLISH → $oc/devices/6ad76a1dcbb0cf6bb98f1aee_stm32-01/sys/properties/report
 > 🔴 上面 `Password` 是 `ts=2026102110` 时的确定输出 ⇒ 可当 C 实现的**固定测试向量**：
 > 输入 `secret` + `ts`，输出必须逐字符相同，不联网就能验 HMAC 实现对不对。
 > ⚠️ 该 `ts` 已过期（平台只认当小时），只用于**离线单测**，不能拿去连。
+
+## `iotda_link_test.py` — IoTDA 连接层语义实测
+
+**用途**：`iotda_probe.py` 只回答"能不能连上"；这个工具回答"**连上之后会怎么死**"。
+四件事官方文档没写清，但 10.23 联调必然撞上，且**全都不需要 ESP8266**。
+
+```bash
+python tools/iotda_link_test.py --host <域名> --device-id <id> --secret <s>
+python tools/iotda_link_test.py ... --only keepalive   # 只扫心跳边界（~20 s）
+python tools/iotda_link_test.py ... --only heartbeat    # 空等被踢 + PINGREQ 保活（~60 s）
+python tools/iotda_link_test.py ... --only dup          # 同 clientId 双连接（~5 s）
+```
+
+### 2026-10-21 实测结论（cn-north-4，本项目实例）
+
+| # | 问题 | 结果 |
+|---|---|---|
+| ① | `keepalive` 合法范围 | **30 … 1200 秒**。`0/1/5/10/20/29` 与 `1201/3600` 全部 `rc=0x02` |
+| ② | 不发 `PINGREQ` 多久被踢 | `keepalive=30` ⇒ **44.6 s**（≈1.5×） |
+| ③ | `QoS1` 是否回执 | **回 `40 02 00 01`**（PUBACK） |
+| ④ | 同 `device_id` 双连接 | 🔴 **两条都 `rc=0x00`、都能收到 PUBACK —— 平台不踢** |
+
+🔴 **①的坑**：把 keepalive 设成 10 想"快点发现断线"，会被**直接拒连**，而返回码是 `0x02`
+（官方解释是 "clientId 格式错/心跳不合法"）—— 极易误判成 ClientId 拼错，半天查不出来。**统一用 120。**
+
+🔴 **④的坑**：PC 探针和板子同 `device_id` 同时在线时，平台不报错、两边都以为正常，
+但**影子只留最后一条**。现象是"影子 77、板子说它发了 99"，人会去怀疑固件/报文/物模型，
+真因是两条连接打架。**联调时只留一条；需要并存就再注册一个 `stm32-02` 给 PC。**
