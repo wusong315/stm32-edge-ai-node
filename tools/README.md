@@ -851,3 +851,25 @@ python tools/iotda_probe.py --host ... --device-id <id> --secret <secret> \
 | `0x02` | clientId 格式错 / 心跳不合法 | ClientId 少了 `_0_0_` 段 |
 | `0x04` | 用户名或密码错 | **`ts` 不是当前 UTC 小时**、secret 被重置过 |
 | `0x05` | 未授权 | 设备没注册到该实例 |
+
+### 2026-10-21 实跑结果（本项目真值，可当 C 端单测向量）
+
+```
+[鉴权] ts=2026102110  sig_type=0  password_mode=ts_key
+  ClientId = 6ad76a1dcbb0cf6bb98f1aee_stm32-01_0_0_2026102110
+  Username = 6ad76a1dcbb0cf6bb98f1aee_stm32-01
+  Password = 68b285aa428562b2d842c9aa66f2d56bb88b45a49898e9530bc969ea9510c177
+CONNACK: session_present=0  rc=0x00 (连接成功)
+PUBLISH → $oc/devices/6ad76a1dcbb0cf6bb98f1aee_stm32-01/sys/properties/report
+          {"services":[{"service_id":"vibration","properties":{"similarity":42,"verdict":"anomaly","ts":"2026102110"}}]}
+```
+
+三条结论（**写 C 时直接照抄，不用再查文档**）：
+
+1. **明文 `1883` 可用** ⇒ 不需要 TLS 栈（省 mbedTLS + RAM + 证书）。
+2. **HMAC 顺序 = `key = ts`，`msg = secret`** —— 两种顺序都试了，`ts_key` **第一次** `rc=0x00`。
+3. **`sig_type=0` 下时间戳仍被强制校验** ⇒ 板上必须有**当小时 UTC**。
+
+> 🔴 上面 `Password` 是 `ts=2026102110` 时的确定输出 ⇒ 可当 C 实现的**固定测试向量**：
+> 输入 `secret` + `ts`，输出必须逐字符相同，不联网就能验 HMAC 实现对不对。
+> ⚠️ 该 `ts` 已过期（平台只认当小时），只用于**离线单测**，不能拿去连。
