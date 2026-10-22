@@ -57,11 +57,10 @@
  *       ⚠️ 依赖 `Core/Src/libneai.a` + `Core/Inc/NanoEdgeAI.h` 这一对库文件，
  *          集成与换库步骤见 `MVP/docs/context/RUNBOOK.md` R10。 */
 /* 🔴 **默认档已改为 3（产品档 = 1 kHz 在线推理）** —— 2026-10-22 配合云端启用。
- *    要"看原始数据"的诊断档，请**用命令行/IDE 覆盖**，别改这里的默认值：
- *      -DAPP_OUTPUT_MODE=0   → 10 Hz 原始整数（验证接线）
- *      -DAPP_OUTPUT_MODE=2   → 1 kHz 二进制帧（采数据集）
- *    为什么必须这样：`APP_CLOUD_ENABLE=1` 要求模式 3，若默认仍是 0，
- *    建了 `secrets.h` 之后**每次编 Debug 都会撞 `#error`** ⇒ 等于把诊断档焊死。 */
+ *    要"看原始数据"的诊断档（0 / 2），**两个开关一起动**：
+ *      ① `Core/Inc/secrets.h` 里 `APP_CLOUD_ENABLE` 改 **0**（云端不参与编译）
+ *      ② 再加 `-DAPP_OUTPUT_MODE=0`（或 2）覆盖这里的默认值
+ *    只改 ② 不改 ① ⇒ 撞下面的 `#error`（云端只在模式 3 下有相似度可报）。 */
 #ifndef APP_OUTPUT_MODE
 #define APP_OUTPUT_MODE     (3)
 #endif
@@ -128,7 +127,7 @@
 #define CLOUD_SIM_ALARM       (90U)        /* 相似度 < 90 判异常（与 R10.9 的 T14 口径一致） */
 
 #if (APP_CLOUD_ENABLE) && (APP_OUTPUT_MODE != 3)
-#error "APP_CLOUD_ENABLE=1 requires APP_OUTPUT_MODE=3: set APP_OUTPUT_MODE to 3 in main.c (or -DAPP_OUTPUT_MODE=3)"
+#error "APP_CLOUD_ENABLE=1 needs APP_OUTPUT_MODE=3. Fix one of them: (a) build with -DAPP_OUTPUT_MODE=3, or (b) set APP_CLOUD_ENABLE 0 in Core/Inc/secrets.h"
 #endif
 
 /* 串口发送队列（环形缓冲）大小，单位字节。
@@ -1461,12 +1460,21 @@ static void App_CloudBegin(void)
 
   /* ---- 参数没配齐就别连 --------------------------------------------
    * 空字符串会让 AT 变成 `AT+CWJAP="",""`，模块回 ERROR，
-   * 现场看起来像"模块坏了"，其实只是没填 secrets.h。 */
-  if ((CLOUD_WIFI_SSID[0] == '\0') || (CLOUD_DEVICE_ID[0] == '\0') ||
-      (CLOUD_SECRET[0] == '\0'))
+   * 现场看起来像"模块坏了"，其实只是没填 secrets.h。
+   * 🔴 **逐个报是哪一个没填** —— 一句笼统的"未配置"会让人把三行都翻一遍。 */
+  if (CLOUD_WIFI_SSID[0] == '\0')
   {
-    printf("[CLOUD] 跳过：Wi-Fi / device_id / secret 未配置"
-           "（建 Core/Inc/secrets.h，见 RUNBOOK R14.12）\r\n");
+    printf("[CLOUD] 跳过：CLOUD_WIFI_SSID 没填（Core/Inc/secrets.h）\r\n");
+    return;
+  }
+  if (CLOUD_DEVICE_ID[0] == '\0')
+  {
+    printf("[CLOUD] 跳过：CLOUD_DEVICE_ID 没填（Core/Inc/secrets.h）\r\n");
+    return;
+  }
+  if (CLOUD_SECRET[0] == '\0')
+  {
+    printf("[CLOUD] 跳过：CLOUD_SECRET 没填（Core/Inc/secrets.h）\r\n");
     return;
   }
 
