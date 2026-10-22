@@ -56,8 +56,14 @@
  *       原始数据），串口只输出相似度与推理耗时。**这是最终产品的形态。**
  *       ⚠️ 依赖 `Core/Src/libneai.a` + `Core/Inc/NanoEdgeAI.h` 这一对库文件，
  *          集成与换库步骤见 `MVP/docs/context/RUNBOOK.md` R10。 */
+/* 🔴 **默认档已改为 3（产品档 = 1 kHz 在线推理）** —— 2026-10-22 配合云端启用。
+ *    要"看原始数据"的诊断档，请**用命令行/IDE 覆盖**，别改这里的默认值：
+ *      -DAPP_OUTPUT_MODE=0   → 10 Hz 原始整数（验证接线）
+ *      -DAPP_OUTPUT_MODE=2   → 1 kHz 二进制帧（采数据集）
+ *    为什么必须这样：`APP_CLOUD_ENABLE=1` 要求模式 3，若默认仍是 0，
+ *    建了 `secrets.h` 之后**每次编 Debug 都会撞 `#error`** ⇒ 等于把诊断档焊死。 */
 #ifndef APP_OUTPUT_MODE
-#define APP_OUTPUT_MODE     (0)
+#define APP_OUTPUT_MODE     (3)
 #endif
 
 #define SAMPLES_PER_FRAME   (32U)     /* 二进制模式每帧点数 */
