@@ -240,13 +240,18 @@ def probe(host: str, port: int, device_id: str, secret: str, ts: str,
 
         if do_publish:
             topic = f"$oc/devices/{device_id}/sys/properties/report"
+            # 🔴 只报物模型里**确实存在**的两个属性（2026-10-22，D33）：
+            #    `ts` 已从物模型删除，数据时间交给平台内建的 eventTime。
+            #    多发一个未定义的属性不会报警，但平台直接忽略 ——
+            #    那样"时间对了"就成了一句没有依据的话。
+            #    这串 payload 与固件 main.c 的 App_CloudReport() **逐字一致**，
+            #    对拍脚本 _tmp/hosttest/test_mqtt.c 用的也是它。
             body = {
                 "services": [{
                     "service_id": service_id,
                     "properties": {
                         "similarity": similarity,
                         "verdict": "anomaly" if similarity < 90 else "normal",
-                        "ts": ts,
                     },
                 }]
             }

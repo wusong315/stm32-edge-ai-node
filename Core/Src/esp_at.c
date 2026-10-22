@@ -64,6 +64,22 @@ static int uart_getc(uint8_t *c)
     return (HAL_UART_Receive(s_uart, c, 1u, 1u) == HAL_OK) ? 1 : 0;
 }
 
+/**
+ * @brief 接收寄存器里是否有字节 —— 纯标志位读，纳秒级
+ *
+ * 🔴 为什么必须有它：`HAL_UART_Receive(..., 1 byte, timeout=1ms)` 在**没有数据**时
+ *    会整整等 1 ms 才返回。主循环里若每次空转都走那条路，1 kHz 采样会直接崩
+ *    （每轮丢 1 拍）。所以"非阻塞收包"（timeout = 0）必须先看标志位再决定要不要读，
+ *    这样空闲时一次循环只花几个指令周期。
+ */
+static int uart_rx_ready(void)
+{
+    if (s_uart == NULL) {
+        return 0;
+    }
+    return (__HAL_UART_GET_FLAG(s_uart, UART_FLAG_RXNE) != RESET) ? 1 : 0;
+}
+
 static void uart_put(const uint8_t *buf, uint16_t len)
 {
     if (s_uart == NULL || buf == NULL || len == 0u) {
@@ -324,13 +340,17 @@ int esp_transparent_recv(uint8_t *buf, uint16_t max_len, uint32_t timeout_ms)
     }
     t0 = HAL_GetTick();
     while (n < max_len) {
+        /* 🔴 先看标志位再读：`uart_getc()` 在没数据时要等满 1 ms，
+         *    而被主循环每轮调用一次的话，1 kHz 采样直接崩（见 uart_rx_ready）。 */
+        if (!uart_rx_ready()) {
+            if ((HAL_GetTick() - t0) >= timeout_ms) {
+                break;              /* timeout_ms == 0 时这里第一次就跳出 = 真非阻塞 */
+            }
+            continue;
+        }
         if (uart_getc(&c)) {
             buf[n++] = c;
             t0 = HAL_GetTick();     /* 有数据就重置超时，尽量把一整个报文收完 */
-            continue;
-        }
-        if ((HAL_GetTick() - t0) >= timeout_ms) {
-            break;
         }
     }
     return (int)n;

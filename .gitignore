@@ -39,6 +39,10 @@ __pycache__/
 .venv/
 venv/
 
+# ===== 密钥（🔴 绝不入库）=====
+# 用法见 Core/Inc/secrets.h.example；密钥进过 git 历史就只能重置设备密钥。
+Core/Inc/secrets.h
+
 # ===== 采集的数据集 / PC 端工具输出（体积大，默认不提交）=====
 # 工具的默认输出落点，用法见 tools/README.md。
 # 确实想提交数据集样本时：git add -f <file>

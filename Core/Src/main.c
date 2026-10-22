@@ -23,7 +23,10 @@
 /* USER CODE BEGIN Includes */
 #include "mpu6050.h"
 #include "neai_app.h"
+#include "mqtt_pkt.h"
+#include "esp_at.h"
 #include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -60,6 +63,67 @@
 #define SAMPLES_PER_FRAME   (32U)     /* 二进制模式每帧点数 */
 #define TEXT_DECIM          (5U)      /* 1000 / 5   = 200 Hz */
 #define DEBUG_DECIM         (100U)    /* 1000 / 100 =  10 Hz */
+
+/* =====================================================================
+ * 第 ⑧ 步：云端上报（MQTT over ESP8266 透传 —— 决策 D33 / D34）
+ * =====================================================================
+ * 开关与参数**全部**可以被 `Core/Inc/secrets.h` 覆盖（那个文件不入库，
+ * 放 Wi-Fi 密码与设备密钥）。没有它时用下面的安全默认值 ——
+ * `APP_CLOUD_ENABLE = 0` ⇒ 整个云端段落不参与编译，行为与第 ⑦ 步一字不差。
+ *
+ * 🔴 为什么**不**做成 `APP_OUTPUT_MODE == 4`
+ * ---------------------------------------------------------------------
+ * 云端是"采样/推理之上的一层"，和"串口往外输出什么"没有关系。做成独立开关后：
+ *   · 最终产品 = `APP_OUTPUT_MODE=3` + `APP_CLOUD_ENABLE=1`
+ *     —— 串口照样能看推理日志，云端同时上报；
+ *   · 不必把模式 3 的采样代码复制一份（复制出来的两份代码迟早会走样）；
+ *   · 想单独验证云端时也不用改模式。
+ * 唯一约束：相似度只有模式 3 产生，所以两者必须配套（见下面的 #error）。
+ */
+
+/* ---- 本地私有参数（不入库）。没有这个文件也不影响编译 ------ */
+#if defined(__has_include)
+#  if __has_include("secrets.h")
+#    include "secrets.h"
+#  endif
+#endif
+
+#ifndef APP_CLOUD_ENABLE
+#define APP_CLOUD_ENABLE      (0)      /* 1 = 启用云端上报（需要 secrets.h 或 -D） */
+#endif
+#ifndef CLOUD_WIFI_SSID
+#define CLOUD_WIFI_SSID       ""       /* 空串 ⇒ 启动时跳过连接，模式 3 照常跑 */
+#endif
+#ifndef CLOUD_WIFI_PASS
+#define CLOUD_WIFI_PASS       ""
+#endif
+#ifndef CLOUD_DEVICE_ID
+#define CLOUD_DEVICE_ID       ""       /* 形如 6ad76a1d..._stm32-01（产品ID_NodeId） */
+#endif
+#ifndef CLOUD_SECRET
+#define CLOUD_SECRET          ""       /* 注册设备时自填的 8~32 位密钥 */
+#endif
+#ifndef CLOUD_HOST
+#define CLOUD_HOST            "f5d6c11092.st1.iotda-device.cn-north-4.myhuaweicloud.com"
+#endif
+#ifndef CLOUD_PORT
+#define CLOUD_PORT            (1883)   /* 明文；8883 是 MQTTS，本项目不用 */
+#endif
+#ifndef AUTH_TS
+#define AUTH_TS               "2026102205"   /* 鉴权 ts（10 位）。sig_type=0 时平台不校验内容 */
+#endif
+
+/* ---- 以下不是"可选项"，而是**实测出来的口径**，改之前先看注释 ---------- */
+#define CLOUD_SERVICE_ID      "vibration"  /* 🔴 与物模型 service_id 逐字一致 */
+#define CLOUD_KEEPALIVE_S     (120U)       /* 🔴 合法区间 30..1200；填 10 会 rc=0x02（实测） */
+#define CLOUD_PERIOD_MS       (30000U)     /* 正常心跳 30 s → 2 880 条/天（配额 28.8 %） */
+#define CLOUD_ALARM_MS        (60000U)     /* 异常持续中 60 s 一条 → 1 440 条/天 */
+#define CLOUD_PING_MS         (60000U)     /* 空闲兜底 PINGREQ（keepalive 1.5 倍 = 180 s 才被踢） */
+#define CLOUD_SIM_ALARM       (90U)        /* 相似度 < 90 判异常（与 R10.9 的 T14 口径一致） */
+
+#if (APP_CLOUD_ENABLE) && (APP_OUTPUT_MODE != 3)
+#error "APP_CLOUD_ENABLE=1 requires APP_OUTPUT_MODE=3: set APP_OUTPUT_MODE to 3 in main.c (or -DAPP_OUTPUT_MODE=3)"
+#endif
 
 /* 串口发送队列（环形缓冲）大小，单位字节。
  * 1024 足够吸收一个二进制帧（197 字节）的突发。 */
@@ -249,6 +313,33 @@ uint32_t g_gap_max_recover= 0U;   /* 该停顿内的总线恢复次数 */
 uint32_t g_gap_cur_fails  = 0U;   /* 下面两个是"当前这一轮"正在累计的同类量 */
 uint32_t g_gap_cur_recover= 0U;
 
+#if (APP_CLOUD_ENABLE)
+/* =====================================================================
+ * 第 ⑧ 步：云端上报的运行态
+ * =====================================================================
+ * 全部放 bss 而不是栈：报文缓冲 386 B，主循环里不想动栈；
+ * 而且这些变量要能用 IDE 的 Live Watch 直接看（调试时比翻日志快）。
+ *
+ * 🔴 为什么只留**一个** `s_pub`：CONNECT 与 PUBLISH 从不同时用
+ *    （CONNECT 在启动阶段同步发完，之后才可能发 PUBLISH）。
+ *    省 386 B RAM，代价是一句注释 —— 值。 */
+static char       s_topic[96];       /* $oc/devices/<id>/sys/properties/report */
+static mqtt_pkt_t s_pub;             /* 复用的报文缓冲（386 B） */
+static uint16_t   s_pub_id = 1U;     /* QoS1 的 packet id，只用来和 PUBACK 对号 */
+
+static struct
+{
+  uint8_t  connected;       /* 1 = CONNACK rc=0，管道可用 */
+  uint8_t  have_verdict;    /* 1 = 已经报过至少一条（第一条不受节拍限制） */
+  uint8_t  alarm;           /* 上一次**已上报**的判定：0 正常 / 1 异常 */
+  uint32_t reports;         /* 成功发出去的条数 */
+  uint32_t pubacks;         /* 收到平台 PUBACK 的次数（= 平台真收到了） */
+  uint32_t errors;          /* 拼包/发送失败次数 */
+  uint32_t last_report_ms;  /* 上一条上报的时刻 */
+  uint32_t last_tx_ms;      /* 上一次"有字节出去"的时刻（keepalive 计时用） */
+} s_cloud;
+#endif
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -271,6 +362,12 @@ static void     App_PwmInit(void);
 static void     App_SetDuty(uint8_t pct);
 static void     App_CmdRxStart(void);
 static void     App_PollCmd(void);
+#if (APP_CLOUD_ENABLE)
+static void     App_CloudBegin(void);
+static void     App_CloudPoll(void);
+static void     App_TxqDrain(uint32_t timeout_ms);
+static void     App_CloudReport(uint8_t sim, uint8_t anomaly);
+#endif
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -1131,6 +1228,329 @@ static void App_PollCmd(void)
   }
 }
 
+#if (APP_CLOUD_ENABLE)
+/* =====================================================================
+ * 三、云端上报（第 ⑧ 步）
+ * =====================================================================
+ * 分工（D34 方案 A）：
+ *   esp_at.c   —— 一根网线：连 Wi-Fi / 建 TCP / 进透传，**不解析任何 MQTT**
+ *   mqtt_pkt.c —— 只拼字节：CONNECT / PUBLISH / PINGREQ，**不碰串口**
+ *   本段       —— 决定"什么时候发、发什么、发完怎么记账"
+ * 这样分层的好处：10.23 上板后如果连不上，可以把"报文拼错"单独排除掉
+ * （PC 上已经逐字节对拍过，见 `_tmp/hosttest/test_mqtt.c`），只剩接线与 AT。
+ *
+ * 上报节拍（依据 R14.9 的配额换算，**别凭感觉改**）
+ * ---------------------------------------------------------------------
+ *   免费单元 10 000 条/天 ≈ 0.116 条/s，于是：
+ *      1 s/条 → 86 400 条/天（超 8.6 倍）🔴 超配额不报错，只**限流**，
+ *                                现象是"数据突然不动了"，很像固件卡死
+ *     30 s/条 →  2 880 条/天（28.8 %）   正常心跳
+ *     60 s/条 →  1 440 条/天（14.4 %）   异常持续中，比正常还省
+ *   策略：**状态变化立刻发**（演示时"一有异常秒出"），持续异常降频到 60 s。
+ *   最坏情况（一直在异常 + 抖边界）也只是 1 440 条的量级，离 10 000 很远。
+ */
+
+/* 把发送队列里的字节全部倒到 USART1 上（最多等 timeout_ms）。
+ *
+ * 🔴 为什么云端连接前**必须**先做这一步：
+ *    printf() 只是把字节塞进 1024 B 的队列，真正往串口倒字节的
+ *    App_PumpUart() 在**主循环**里。而 esp_join() 最长阻塞 25 s，
+ *    这期间主循环一动不动 ⇒ 队列很快塞满 ⇒ 之后所有日志被丢弃。
+ *    丢掉的恰好是 "CONNACK rc=0x00 还是 0x04" 这种最关键的一行，
+ *    串口上看起来就是"连到一半没声了"，极难判断走到哪一步。 */
+static void App_TxqDrain(uint32_t timeout_ms)
+{
+  uint32_t t0 = HAL_GetTick();
+
+  while ((g_txq_head != g_txq_tail) && ((HAL_GetTick() - t0) < timeout_ms))
+  {
+    App_PumpUart();
+  }
+}
+
+/* 发一条 properties/report（QoS1，平台会回 PUBACK）。
+ *
+ * payload 只有两个属性，与物模型逐字对应：
+ *   {"services":[{"service_id":"vibration","properties":
+ *     {"similarity":92,"verdict":"normal"}}]}
+ *
+ * 🔴 **不带 `ts`**：物模型里的 `ts` 属性已于 2026-10-22 删除（D33），
+ *    数据时间交给平台内建的 `eventTime`。带着它不会报错，但平台直接忽略，
+ *    反而容易让人误以为"时间是我发的"。 */
+static void App_CloudReport(uint8_t sim, uint8_t anomaly)
+{
+  static char js[160];
+  int         len;
+  uint16_t    plen;
+
+  len = snprintf(js, sizeof js,
+                 "{\"services\":[{\"service_id\":\"%s\",\"properties\":"
+                 "{\"similarity\":%u,\"verdict\":\"%s\"}}]}",
+                 CLOUD_SERVICE_ID, (unsigned)sim,
+                 (anomaly != 0U) ? "anomaly" : "normal");
+  if ((len <= 0) || (len >= (int)sizeof js))
+  {
+    s_cloud.errors++;
+    return;                                  /* 理论上不可能：字段都是定长小数字 */
+  }
+
+  plen = mqtt_encode_publish(&s_pub, s_topic, (const uint8_t *)js,
+                             (uint16_t)len, 1U, s_pub_id);
+  if (plen == 0U)
+  {
+    s_cloud.errors++;
+    return;
+  }
+  s_pub_id++;                                /* 0 会被当成非法 id，翻转后跳过 0 */
+  if (s_pub_id == 0U)
+  {
+    s_pub_id = 1U;
+  }
+
+  if (esp_transparent_send(s_pub.buf, plen) != (int)plen)
+  {
+    s_cloud.errors++;
+    return;
+  }
+
+  s_cloud.reports++;
+  s_cloud.last_report_ms = HAL_GetTick();
+  s_cloud.last_tx_ms     = s_cloud.last_report_ms;
+  s_cloud.alarm          = anomaly;
+  s_cloud.have_verdict   = 1U;
+
+  printf("[CLOUD] #%lu sim=%u %s (puback=%lu)\r\n",
+         (unsigned long)s_cloud.reports, (unsigned)sim,
+         (anomaly != 0U) ? "ANOMALY" : "normal",
+         (unsigned long)s_cloud.pubacks);
+}
+
+/* 把已经到达的字节收下来（**非阻塞**，timeout = 0）。
+ *
+ * 透传模式下收到的就是裸 MQTT 报文，只会是这三种之一：
+ *   PUBACK   `40 02 xx xx`   —— QoS1 上报的回执，说明平台真收到了
+ *   PINGRESP `D0 00`         —— 心跳应答
+ *   CONNACK  `20 02 ..`      —— 只可能出现在刚连上时（这里当异常处理）
+ * 我们没有订阅任何 topic，所以不会有 PUBLISH 进来。
+ * 🔴 只认这几种定长报文，**不实现**通用的剩余长度解析 —— 省 Flash，也避免
+ *    "为了通用而写错"：真收到看不懂的字节就计数，不猜。 */
+static void App_CloudDrainRx(void)
+{
+  uint8_t rx[16];
+  int     n;
+  uint8_t i = 0U;
+
+  n = esp_transparent_recv(rx, (uint16_t)sizeof rx, 0U);
+  if (n <= 0)
+  {
+    return;                                  /* 0 = 没数据，<0 = 状态错，都不用管 */
+  }
+
+  while ((i + 2U) <= (uint8_t)n)
+  {
+    switch (rx[i] & 0xF0U)
+    {
+      case 0x40U:                            /* PUBACK，4 字节 */
+        if ((uint8_t)(i + 4U) > (uint8_t)n) { return; }
+        s_cloud.pubacks++;
+        i = (uint8_t)(i + 4U);
+        break;
+
+      case 0xD0U:                            /* PINGRESP，2 字节 */
+        i = (uint8_t)(i + 2U);
+        break;
+
+      case 0x20U:                            /* CONNACK（不该在这时候出现） */
+        if ((uint8_t)(i + 4U) > (uint8_t)n) { return; }
+        printf("[CLOUD] 意外收到 CONNACK rc=0x%02X\r\n", (unsigned)rx[i + 3U]);
+        i = (uint8_t)(i + 4U);
+        break;
+
+      default:                               /* 看不懂就不猜，留着下次一起丢 */
+        printf("[CLOUD] 收到无法识别的字节 0x%02X (len=%d)\r\n",
+               (unsigned)rx[i], n);
+        return;
+    }
+  }
+}
+
+/* 主循环里调，**非阻塞、微秒级**。
+ *
+ * 🔴 这里任何一次阻塞都会直接变成采样丢点（lost 计数），所以：
+ *    · 不在这里做 AT 指令、不重连（重连会阻塞 25 s，见 App_CloudBegin 的说明）；
+ *    · 接收用 timeout=0，靠 esp_at.c 里的 RXNE 标志位预判，不做 1 ms 忙等；
+ *    · 连不上就静默降级（云端不影响采样与推理，这是本项目一贯的取舍）。 */
+static void App_CloudPoll(void)
+{
+  const neai_app_stats_t *st;
+  uint32_t now;
+  uint32_t period;
+  uint8_t  sim;
+  uint8_t  alarm;
+
+  if (s_cloud.connected == 0U)
+  {
+    return;
+  }
+
+  App_CloudDrainRx();
+
+  st = NEAI_AppStats();
+  if (st->detect_calls == 0U)
+  {
+    /* 还没跑完第一次推理（含开机学习期约 37 s）—— 此时的 last_similarity
+     * 还是 0，报上去就是一条假的"极度异常"。宁可不报。 */
+    return;
+  }
+
+  now   = HAL_GetTick();
+  sim   = st->last_similarity;
+  alarm = (sim < CLOUD_SIM_ALARM) ? 1U : 0U;
+
+  /* ① 第一条 / 判定翻转 → 立刻发（演示时"异常秒出"就靠这一条） */
+  if ((s_cloud.have_verdict == 0U) || (alarm != s_cloud.alarm))
+  {
+    App_CloudReport(sim, alarm);
+    return;
+  }
+
+  /* ② 持续同一判定 → 按节拍发（正常 30 s / 异常 60 s） */
+  period = (alarm != 0U) ? CLOUD_ALARM_MS : CLOUD_PERIOD_MS;
+  if ((now - s_cloud.last_report_ms) >= period)
+  {
+    App_CloudReport(sim, alarm);
+    return;
+  }
+
+  /* ③ 兜底心跳：万一长时间没发任何东西（比如相似度一直没更新），
+   *    keepalive 到期会被平台踢（实测 ≈1.5 倍 keepalive）。 */
+  if ((now - s_cloud.last_tx_ms) >= CLOUD_PING_MS)
+  {
+    uint16_t plen = mqtt_encode_pingreq(&s_pub);
+    if ((plen > 0U) && (esp_transparent_send(s_pub.buf, plen) == (int)plen))
+    {
+      s_cloud.last_tx_ms = now;
+    }
+  }
+}
+
+/* 启动阶段一次性把管道建起来（**阻塞**，最长约 30 s）。
+ *
+ * 🔴 必须在上面的 `HAL_TIM_Base_Start_IT(&htim2)` **之前**调用：
+ *    这里会阻塞几秒到几十秒（等 DHCP、等 CONNACK），而 g_tick 一旦开始走，
+ *    这段时间的全部拍子都会被记成 lost —— 上板验收会看到恒定的几百点丢失，
+ *    然后花半天去查 I2C。放在启动节拍之前，这问题根本不存在。
+ *
+ * 🔴 失败**不影响**采样与推理：云端只是"多一条数据出口"，
+ *    不是运行的前提。连不上就打印原因、置 connected=0、继续跑模式 3。
+ *    （自动重连留给 T10 的后续：重连要 25 s，会阻塞采样，得做成状态机，
+ *      这一轮不做 —— 现在先保证"能连上、能上报、能看到数"。） */
+static void App_CloudBegin(void)
+{
+  char     cid[80];
+  char     pw[65];
+  int      n;
+  int      rc;
+  uint8_t  rx[16];
+
+  /* ---- 参数没配齐就别连 --------------------------------------------
+   * 空字符串会让 AT 变成 `AT+CWJAP="",""`，模块回 ERROR，
+   * 现场看起来像"模块坏了"，其实只是没填 secrets.h。 */
+  if ((CLOUD_WIFI_SSID[0] == '\0') || (CLOUD_DEVICE_ID[0] == '\0') ||
+      (CLOUD_SECRET[0] == '\0'))
+  {
+    printf("[CLOUD] 跳过：Wi-Fi / device_id / secret 未配置"
+           "（建 Core/Inc/secrets.h，见 RUNBOOK R14.12）\r\n");
+    return;
+  }
+
+  printf("[CLOUD] 连接 %s:%d ...\r\n", CLOUD_HOST, (int)CLOUD_PORT);
+  App_TxqDrain(3000U);                 /* 先把启动横幅倒干净，理由见上 */
+
+  /* ---- ① AT 握手 --------------------------------------------------- */
+  esp_init(&huart3);
+  if (esp_ping() != ESP_OK)
+  {
+    printf("[CLOUD] ESP 无应答 —— 查 PB10/PB11 是否交叉、共地、3V3；"
+           "以及 D1 mini 的 USB 是否还插着\r\n");
+    return;
+  }
+  (void)esp_echo_off();                /* 关不掉不致命，只是日志吵一倍 */
+  App_TxqDrain(300U);
+
+  /* ---- ② 连 Wi-Fi（最长 25 s，DHCP 慢的时候真的会到 10 s 以上）------ */
+  if (esp_join(CLOUD_WIFI_SSID, CLOUD_WIFI_PASS) != ESP_OK)
+  {
+    printf("[CLOUD] 连 Wi-Fi 失败 —— 查 SSID/密码、路由器是否 2.4 GHz\r\n");
+    return;
+  }
+  App_TxqDrain(500U);
+
+  /* ---- ③ 建 TCP -------------------------------------------------- */
+  if (esp_tcp_open(CLOUD_HOST, (uint16_t)CLOUD_PORT) != ESP_OK)
+  {
+    printf("[CLOUD] TCP 连接失败 —— 查域名拼写、端口 1883\r\n");
+    return;
+  }
+  App_TxqDrain(500U);
+
+  /* ---- ④ 进透传：此后写出去的字节**就是** MQTT 报文 ---------------- */
+  if (esp_enter_transparent() != ESP_OK)
+  {
+    printf("[CLOUD] 进透传失败（CIPMODE/CIPSEND）\r\n");
+    return;
+  }
+
+  /* ---- ⑤ 拼 CONNECT 并发出去 -------------------------------------- */
+  if (mqtt_auth_build(CLOUD_DEVICE_ID, CLOUD_SECRET, AUTH_TS, 0U,
+                      cid, sizeof cid, pw, sizeof pw) != 0)
+  {
+    printf("[CLOUD] 鉴权参数非法（device_id 或 ts 长度不对）\r\n");
+    return;
+  }
+  if (mqtt_encode_connect(&s_pub, cid, CLOUD_DEVICE_ID, pw,
+                          CLOUD_KEEPALIVE_S) == 0U)
+  {
+    printf("[CLOUD] CONNECT 拼包失败（缓冲不够）\r\n");
+    return;
+  }
+  if (esp_transparent_send(s_pub.buf, s_pub.len) != (int)s_pub.len)
+  {
+    printf("[CLOUD] CONNECT 发送失败\r\n");
+    return;
+  }
+
+  /* ---- ⑥ 等 CONNACK ----------------------------------------------
+   * 实测 4 字节 `20 02 00 00`。rc 的含义见 mqtt_pkt.h：
+   *   0x00 成功 / 0x02 clientId 或 keepalive 非法 / 0x04 用户名密码错 / 0x05 未授权 */
+  n = esp_transparent_recv(rx, (uint16_t)sizeof rx, 5000U);
+  if (n <= 0)
+  {
+    printf("[CLOUD] 等 CONNACK 超时（平台没回）\r\n");
+    return;
+  }
+  rc = mqtt_connack_rc(rx, (uint16_t)n);
+  if (rc != 0)
+  {
+    printf("[CLOUD] CONNACK 失败 rc=%d（0x%02X）—— 见 RUNBOOK R14.2 ①\r\n",
+           rc, (n >= 4) ? (unsigned)rx[3] : 0U);
+    return;
+  }
+
+  /* ---- ⑦ 记账，准备上报 ------------------------------------------- */
+  (void)snprintf(s_topic, sizeof s_topic,
+                 "$oc/devices/%s/sys/properties/report", CLOUD_DEVICE_ID);
+  s_cloud.connected      = 1U;
+  s_cloud.last_tx_ms     = HAL_GetTick();   /* CONNECT 本身也算一次活动 */
+  s_cloud.last_report_ms = s_cloud.last_tx_ms;
+
+  printf("[CLOUD] ✅ CONNACK rc=0x00，管道就绪"
+         "（上报节拍 %u s / 异常 %u s，阈值 sim<%u）\r\n",
+         (unsigned)(CLOUD_PERIOD_MS / 1000U), (unsigned)(CLOUD_ALARM_MS / 1000U),
+         (unsigned)CLOUD_SIM_ALARM);
+}
+#endif /* APP_CLOUD_ENABLE */
+
 /* USER CODE END 0 */
 
 /**
@@ -1191,6 +1611,14 @@ int main(void)
 #elif (APP_OUTPUT_MODE == 3)
   printf("mode 3: on-device inference @1 kHz (NanoEdge AI, similarity + us)\r\n");
 #endif
+#if (APP_CLOUD_ENABLE)
+  /* 这一行是"云端到底开没开、往哪儿发、多久发一次"的唯一现场证据 ——
+   * 联调时先看它，比翻代码快。 */
+  printf("cloud: IoTDA %s:%d, up %u s / alarm %u s, service=%s\r\n",
+         CLOUD_HOST, (int)CLOUD_PORT,
+         (unsigned)(CLOUD_PERIOD_MS / 1000U), (unsigned)(CLOUD_ALARM_MS / 1000U),
+         CLOUD_SERVICE_ID);
+#endif
 
   /* 第 ⑦ 步的 PWM 状态 —— 一行说清"在哪儿、多少 Hz、当前占空比"。
    * 频率这里**算出来**而不是写死，免得改了 PSC/ARR 之后横幅说假话。
@@ -1208,6 +1636,14 @@ int main(void)
    *    ② 模式 0/1/2 下没人喂数据，所以它**完全是惰性的**，不影响采样与点灯验证。
    * 若只想验证"没有 AI 的纯采集链路"，可用 -DAPP_NEAI_ENABLE=0 重编一版做对照。 */
   NEAI_AppInit();
+
+#if (APP_CLOUD_ENABLE)
+  /* ---- 第 ⑧ 步：建云端管道（🔴 必须在启动 1 kHz 节拍之前）-----------
+   * 这一步会阻塞几秒到三十秒（DHCP + CONNACK）。放在 TIM2 启动**之前**，
+   * 这段等待就完全不计入采样丢失；放在之后，会看到一块固定的 lost 尖峰，
+   * 然后被误判成 I2C 问题。失败也不影响采样与推理（内部自己降级）。 */
+  App_CloudBegin();
+#endif
 
   /* ---- 启动 1 kHz 采样节拍 ------------------------------------------
    * 🔴 必须是 Start_IT（带中断）而不是 Start：
@@ -1233,17 +1669,23 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* 主循环四件事，按“越频繁越靠前”排：
+    /* 主循环五件事，按“越频繁越靠前”排：
      *   1) 倒串口 —— 每次只吐 4 字节，保证 1 ms 采样节拍不被拖垮；
      *   2) 处理采样 —— 有新拍才动，没新拍立刻返回；
      *   3) 传感器掉线重连 —— 没事时也立刻返回；
-     *   4) 执行串口命令（第 ⑦ 步：改 PWM 占空比）—— 没命令时立刻返回。
+     *   4) 执行串口命令（第 ⑦ 步：改 PWM 占空比）—— 没命令时立刻返回；
+     *   5) 云端上报（第 ⑧ 步）—— 非阻塞：收包用 timeout=0，
+     *      只到 30 s 节拍才真的发一包（发一包 ≈ 200 字节 ≈ 17 ms，
+     *      摊到 30 s 上是 0.06 %，对采样没有一点影响）。
      * 设计上这里**没有 HAL_Delay / 阻塞等待**，主循环全速空转，
      * 因此采样抖动只取决于 I2C 与串口的实际耗时之和。 */
     App_PumpUart();
     App_OnTick();
     App_EnsureSensor();
     App_PollCmd();
+#if (APP_CLOUD_ENABLE)
+    App_CloudPoll();
+#endif
 
     /* USER CODE END WHILE */
 
