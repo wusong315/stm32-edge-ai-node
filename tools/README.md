@@ -840,7 +840,10 @@ python tools/iotda_probe.py --host ... --device-id <id> --secret <secret> \
 | `Password` | `HMAC-SHA256` 的小写十六进制 |
 | `ts` | **UTC** `YYYYMMDDHH` |
 
-⚠️ **明文 MQTT 平台也强制校验时间戳** ⇒ `ts` 必须是当前 UTC 小时。
+🟢 **`sig_type=0` 时平台不校验时间戳**（2026-10-22 实测，推翻英文文档里 forcibly verifies 那句）：
+`sig=0` 配 2020 / 2030 / 2099 年的 `ts` 全部 `rc=0x00`；`sig=1` 配错年份才是 `0x04`。
+⇒ `ClientId` 里的 `sig_type` 位**就是开关本身**，**设备端不需要 SNTP / RTC**，`ts` 用常量即可。
+复现：`python tools/iotda_link_test.py ... --only ts`
 ⚠️ 中英文文档对 HMAC 的 key/msg 顺序表述不一致 ⇒ 用 `--auto` 让返回码定真值，别猜。
 
 ### 返回码
@@ -884,6 +887,7 @@ python tools/iotda_link_test.py --host <域名> --device-id <id> --secret <s>
 python tools/iotda_link_test.py ... --only keepalive   # 只扫心跳边界（~20 s）
 python tools/iotda_link_test.py ... --only heartbeat    # 空等被踢 + PINGREQ 保活（~60 s）
 python tools/iotda_link_test.py ... --only dup          # 同 clientId 双连接（~5 s）
+python tools/iotda_link_test.py ... --only ts           # sig_type × ts 矩阵（~10 s）
 ```
 
 ### 2026-10-21 实测结论（cn-north-4，本项目实例）
