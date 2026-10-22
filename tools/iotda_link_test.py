@@ -154,13 +154,68 @@ def test_dup(host, port, dev, sec):
     return ra is True and rb is True
 
 
+def test_ts(host, port, dev, sec):
+    """sig_type 与 ts 的组合矩阵 —— 判平台到底校不校时间。
+
+    2026-10-22 实测（cn-north-4）：sig=0 对任何 ts 都放行；sig=1 才严格校验。
+    ⇒ ClientId 里的 sig_type 位就是开关本身；设备端不需要 SNTP / RTC。
+    """
+    print("\n===== ④ sig_type × ts 矩阵 =====")
+    cases = [
+        (0, P.utc_stamp(), "当小时"),
+        (0, "2020010100", "六年前"),
+        (0, "2030010100", "四年后"),
+        (0, "2099123123", "下世纪"),
+        (1, P.utc_stamp(), "当小时"),
+        (1, "2020010100", "六年前"),
+        (1, "2030010100", "四年后"),
+    ]
+    res = {}
+    for sig, ts, label in cases:
+        try:
+            s, rc = _open_ts(host, port, dev, sec, ts, sig)
+            s.sendall(P.mqtt_disconnect())
+            s.close()
+        except OSError as e:
+            print(f"  sig={sig} ts={ts:14s} {label:8s} 连接异常 {e}")
+            continue
+        res[(sig, ts)] = rc
+        print(f"  sig={sig} ts={ts:14s} {label:8s} rc=0x{rc:02X} "
+              f"{'OK' if rc == 0 else 'REJECT'}")
+    # 对照：ts 正确但密码错 ⇒ 应 0x04（证明 HMAC 本身在生效）
+    s, rcbad = _open_ts(host, port, dev, sec, P.utc_stamp(), 0, bad_pw=True)
+    print(f"  对照：ts 正确 + 密码错 -> rc=0x{rcbad:02X} "
+          f"{'OK（符合预期：HMAC 在生效）' if rcbad == 0x04 else '⚠️ 居然连上！'}")
+    s.close()
+
+    sig0_ok = all(v == 0 for (sig, _), v in res.items() if sig == 0)
+    sig1_bad_ok = all(v != 0 for (sig, ts), v in res.items()
+                      if sig == 1 and ts != P.utc_stamp())
+    if sig0_ok and sig1_bad_ok:
+        print("  🟢 结论：sig_type=0 不校验时间戳；sig_type=1 严格校验。")
+        print("     ⇒ 设备端不需要 SNTP / RTC，AUTH_TS 用常量即可。")
+    return sig0_ok and sig1_bad_ok
+
+
+def _open_ts(host, port, dev, sec, ts, sig, bad_pw=False):
+    """用指定的 ts / sig_type 建连（密码仍按 ts_key 算；bad_pw 时故意写错）。"""
+    pw = ("00" * 32) if bad_pw else __import__("hmac").new(
+        ts.encode(), sec.encode(), __import__("hashlib").sha256).hexdigest()
+    cid = f"{dev}_0_{sig}_{ts}"
+    s = socket.create_connection((host, port), timeout=8)
+    s.sendall(P.mqtt_connect(cid, dev, pw, keepalive=120))
+    sp, rc = P._recv_connack(s)
+    s.settimeout(3.0)
+    return s, rc
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="IoTDA 连接层语义实测")
     ap.add_argument("--host", required=True)
     ap.add_argument("--port", type=int, default=1883)
     ap.add_argument("--device-id", required=True)
     ap.add_argument("--secret", required=True)
-    ap.add_argument("--only", choices=["keepalive", "heartbeat", "dup"])
+    ap.add_argument("--only", choices=["keepalive", "heartbeat", "dup", "ts"])
     a = ap.parse_args(argv)
 
     res = {}
@@ -170,6 +225,8 @@ def main(argv=None):
         res["heartbeat"] = test_heartbeat(a.host, a.port, a.device_id, a.secret)
     if a.only in (None, "dup"):
         res["dup"] = test_dup(a.host, a.port, a.device_id, a.secret)
+    if a.only in (None, "ts"):
+        res["ts"] = test_ts(a.host, a.port, a.device_id, a.secret)
 
     print("\n===== 汇总 =====")
     for k, v in res.items():

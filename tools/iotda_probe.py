@@ -22,11 +22,14 @@ ESP8266 D1 mini 的物流到 10.23 才到，但**云侧能不能连通、鉴权�
   Password = HMAC-SHA256(...) 的小写十六进制       （key/msg 顺序见 --auto）
   ts       = UTC 时间 "YYYYMMDDHH"
 
-  🔴 **明文 MQTT 下平台强制校验时间戳**（英文文档原文："MQTT access has a high risk
-     of replay attacks. Therefore, the platform forcibly verifies the timestamp by
-     default, regardless of whether the value is set to 0 or 1."）
-     ⇒ 设备端必须有**准确的 UTC 时间**。ESP8266 可用 SNTP AT 命令取时间
-       （`AT+CIPSNTPCFG=1,8,"ntp.aliyun.com"` → `AT+CIPSNTPTIME?`），见 --sntp-hint。
+  🟢 **`sig_type=0` 时平台不校验时间戳**（2026-10-22 实测，推翻英文文档那句
+     "the platform forcibly verifies the timestamp by default, regardless of
+     whether the value is set to 0 or 1"）：
+       sig=0 + ts ∈ {2020 年, 2030 年, 2099 年}  -> 全部 rc=0x00 连上
+       sig=1 + 同一个错年份                      -> rc=0x04 被拒
+     ⇒ `ClientId` 里的 `sig_type` 位**就是开关本身**。设备端**不需要 SNTP / RTC**，
+       `ts` 用常量即可。⚠️ 但仍建议留可覆盖的常量，平台行为可能随版本变。
+     （复现：`python tools/iotda_link_test.py ... --only ts`）
 
 返回码（CONNACK byte 4）
 --------------------------------------------------------------------------
