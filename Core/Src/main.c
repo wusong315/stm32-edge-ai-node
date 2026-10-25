@@ -125,6 +125,8 @@
 #define CLOUD_ALARM_MS        (60000U)     /* 异常持续中 60 s 一条 → 1 440 条/天 */
 #define CLOUD_PING_MS         (60000U)     /* 空闲兜底 PINGREQ（keepalive 1.5 倍 = 180 s 才被踢） */
 #define CLOUD_SIM_ALARM       (90U)        /* 相似度 < 90 判异常（与 R10.9 的 T14 口径一致） */
+#define CLOUD_SIM_CLEAR       (95U)        /* > 95 才解除异常 —— 迟滞 5 分，防抖 */
+#define CLOUD_MIN_GAP_MS      (5000U)      /* 任意两条上报之间至少 5 s（翻转也不例外） */
 
 #if (APP_CLOUD_ENABLE) && (APP_OUTPUT_MODE != 3)
 #error "APP_CLOUD_ENABLE=1 needs APP_OUTPUT_MODE=3. Fix one of them: (a) build with -DAPP_OUTPUT_MODE=3, or (b) set APP_CLOUD_ENABLE 0 in Core/Inc/secrets.h"
@@ -1137,6 +1139,26 @@ static void App_CmdRxStart(void)
   (void)HAL_UART_Receive_IT(&huart1, (uint8_t *)&s_rx_byte, 1U);
 }
 
+/* UART 出错回调 —— 必须处理，否则模块会"突然变哑"。
+ *
+ * 🔴 触发场景：ORE（溢出）。115200 下一个字节 87 µs，主循环任何 >87 µs 的停顿
+ *    都可能让 DR 被覆盖。HAL 在 ORE 后会调用 AbortReceive 把接收**停掉**，
+ *    此后 RxCpltCallback 再也不进来，表象就是"ESP 没反应了"。
+ *    处理办法 = 清标志 + 重新装机。
+ * 2026-10-25 加：配合 esp_at.c 的中断收包，PUBACK 才收得到。 */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  __HAL_UART_CLEAR_OREFLAG(huart);
+  huart->ErrorCode = HAL_UART_ERROR_NONE;
+
+  if (huart->Instance == USART3)
+  {
+    esp_rx_restart();                   /* 寄存器级重新打开 RXNEIE */
+    return;
+  }
+  (void)HAL_UART_Receive_IT(huart, (uint8_t *)&s_rx_byte, 1U);
+}
+
 /* UART 收满一个字节的回调（**中断上下文** —— 别在这里 printf、别在这里改寄存器）。
  * 解析规则故意做得又笨又松，用串口工具手打也不会崩：
  *   'd' / 'D'                → 这是一条"设占空比"命令
@@ -1330,6 +1352,18 @@ static void App_CloudReport(uint8_t sim, uint8_t anomaly)
          (unsigned long)s_cloud.pubacks);
 }
 
+/* 跨次调用的收包暂存区。
+ *
+ * 🔴 **必须保留半包**：串口是字节流，PUBACK 的 4 个字节完全可能分两次到达。
+ *    2026-10-25 上板实测（v17）就是这样：一次读到 `40 02`、下一次读到 `00 00`。
+ *    旧代码看到"不够 4 字节"直接 return，把已经收到的 2 字节**扔掉**，
+ *    下一轮于是把 `0x00` 当成报文头 ⇒ 整条字节流错位，
+ *    表现为 `puback` 永远停在 1，并且不停打印"收到无法识别的字节 0x02 / 0x00"。
+ *    现在改成"收进暂存区 → 按定长切 → 只消费整条到齐的部分"。 */
+#define CLOUD_RX_CAP   (32u)
+static uint8_t  s_rxb[CLOUD_RX_CAP];
+static uint16_t s_rxn = 0u;
+
 /* 把已经到达的字节收下来（**非阻塞**，timeout = 0）。
  *
  * 透传模式下收到的就是裸 MQTT 报文，只会是这三种之一：
@@ -1338,44 +1372,74 @@ static void App_CloudReport(uint8_t sim, uint8_t anomaly)
  *   CONNACK  `20 02 ..`      —— 只可能出现在刚连上时（这里当异常处理）
  * 我们没有订阅任何 topic，所以不会有 PUBLISH 进来。
  * 🔴 只认这几种定长报文，**不实现**通用的剩余长度解析 —— 省 Flash，也避免
- *    "为了通用而写错"：真收到看不懂的字节就计数，不猜。 */
+ *    "为了通用而写错"：真收到看不懂的字节就清缓冲，不猜。 */
 static void App_CloudDrainRx(void)
 {
-  uint8_t rx[16];
-  int     n;
-  uint8_t i = 0U;
+  int      n;
+  uint8_t  type;
+  uint16_t rl;
+  uint16_t need;
+  uint16_t k;
 
-  n = esp_transparent_recv(rx, (uint16_t)sizeof rx, 0U);
-  if (n <= 0)
+  /* ① 收：接到暂存区尾部。收满就先不读，剩下的下一轮再说（不丢数据） */
+  if (s_rxn < CLOUD_RX_CAP)
   {
-    return;                                  /* 0 = 没数据，<0 = 状态错，都不用管 */
+    n = esp_transparent_recv(&s_rxb[s_rxn],
+                             (uint16_t)(CLOUD_RX_CAP - s_rxn), 0U);
+    if (n > 0)
+    {
+      s_rxn = (uint16_t)(s_rxn + (uint16_t)n);
+    }
   }
 
-  while ((i + 2U) <= (uint8_t)n)
+  /* ② 解：只消费"整条到齐"的报文，半包留在缓冲区里等下一轮补齐 */
+  while (s_rxn >= 2u)
   {
-    switch (rx[i] & 0xF0U)
+    type = (uint8_t)(s_rxb[0] & 0xF0U);
+    rl   = (uint16_t)(s_rxb[1] & 0x7FU);   /* 三种报文 RL 都 < 128 ⇒ 单字节编码 */
+
+    if (rl > 4u)
     {
-      case 0x40U:                            /* PUBACK，4 字节 */
-        if ((uint8_t)(i + 4U) > (uint8_t)n) { return; }
+      /* 我们只订阅了三种定长报文，RL 不可能超过 4 —— 说明已经错位了，
+       * 只能整体丢弃重新找同步点（比逐字节猜安全）。 */
+      printf("[CLOUD] 报文长度异常 rl=%u，清空接收缓冲\r\n", (unsigned)rl);
+      s_rxn = 0u;
+      return;
+    }
+
+    need = (uint16_t)(2u + rl);
+    if (s_rxn < need)
+    {
+      return;                              /* 半包：等下一轮 */
+    }
+
+    switch (type)
+    {
+      case 0x40U:                          /* PUBACK —— 平台真收到了 */
         s_cloud.pubacks++;
-        i = (uint8_t)(i + 4U);
         break;
 
-      case 0xD0U:                            /* PINGRESP，2 字节 */
-        i = (uint8_t)(i + 2U);
+      case 0xD0U:                          /* PINGRESP */
         break;
 
-      case 0x20U:                            /* CONNACK（不该在这时候出现） */
-        if ((uint8_t)(i + 4U) > (uint8_t)n) { return; }
-        printf("[CLOUD] 意外收到 CONNACK rc=0x%02X\r\n", (unsigned)rx[i + 3U]);
-        i = (uint8_t)(i + 4U);
+      case 0x20U:                          /* CONNACK（不该在这时候出现） */
+        printf("[CLOUD] 意外收到 CONNACK rc=0x%02X\r\n",
+               (unsigned)s_rxb[3]);
         break;
 
-      default:                               /* 看不懂就不猜，留着下次一起丢 */
-        printf("[CLOUD] 收到无法识别的字节 0x%02X (len=%d)\r\n",
-               (unsigned)rx[i], n);
+      default:                             /* 看不懂就不猜，清空重同步 */
+        printf("[CLOUD] 收到无法识别的报文 0x%02X (rl=%u)，清空接收缓冲\r\n",
+               (unsigned)s_rxb[0], (unsigned)rl);
+        s_rxn = 0u;
         return;
     }
+
+    /* 消费掉这一条，剩下的左移（最多 32 字节，代价可忽略） */
+    for (k = need; k < s_rxn; k++)
+    {
+      s_rxb[k - need] = s_rxb[k];
+    }
+    s_rxn = (uint16_t)(s_rxn - need);
   }
 }
 
@@ -1410,16 +1474,39 @@ static void App_CloudPoll(void)
 
   now   = HAL_GetTick();
   sim   = st->last_similarity;
-  alarm = (sim < CLOUD_SIM_ALARM) ? 1U : 0U;
 
-  /* ① 第一条 / 判定翻转 → 立刻发（演示时"异常秒出"就靠这一条） */
-  if ((s_cloud.have_verdict == 0U) || (alarm != s_cloud.alarm))
+  /* 🔴 迟滞（hysteresis）：进异常用 90，退异常要回到 95 以上。
+   *    只用一个门槛时，相似度在 90 附近抖动会让判定每个窗口翻一次 ——
+   *    2026-10-25 上板实测：60 s 内发了 **75 条**上报（按 30 s 节拍应该是 2 条），
+   *    既打爆链路也打爆平台配额，日志还被刷得看不见别的。
+   *    迟滞 + 下面的最小间隔一起解决这个问题。 */
+  if (s_cloud.alarm != 0U)
+  {
+    alarm = (sim > CLOUD_SIM_CLEAR) ? 0U : 1U;
+  }
+  else
+  {
+    alarm = (sim < CLOUD_SIM_ALARM) ? 1U : 0U;
+  }
+
+  /* ① 第一条：立刻发，让平台一上电就有数 */
+  if (s_cloud.have_verdict == 0U)
   {
     App_CloudReport(sim, alarm);
     return;
   }
 
-  /* ② 持续同一判定 → 按节拍发（正常 30 s / 异常 60 s） */
+  /* ② 判定翻转 → 尽快发（演示时"异常秒出"靠这一条），
+   *    但受最小间隔约束：真实振动信号会在门槛附近来回跳，
+   *    不设下限的话"秒出"就变成"每秒一条"。 */
+  if ((alarm != s_cloud.alarm) &&
+      ((now - s_cloud.last_report_ms) >= CLOUD_MIN_GAP_MS))
+  {
+    App_CloudReport(sim, alarm);
+    return;
+  }
+
+  /* ③ 持续同一判定 → 按节拍发（正常 30 s / 异常 60 s） */
   period = (alarm != 0U) ? CLOUD_ALARM_MS : CLOUD_PERIOD_MS;
   if ((now - s_cloud.last_report_ms) >= period)
   {
@@ -1427,7 +1514,7 @@ static void App_CloudPoll(void)
     return;
   }
 
-  /* ③ 兜底心跳：万一长时间没发任何东西（比如相似度一直没更新），
+  /* ④ 兜底心跳：万一长时间没发任何东西（比如相似度一直没更新），
    *    keepalive 到期会被平台踢（实测 ≈1.5 倍 keepalive）。 */
   if ((now - s_cloud.last_tx_ms) >= CLOUD_PING_MS)
   {
@@ -1485,9 +1572,27 @@ static void App_CloudBegin(void)
   esp_init(&huart3);
   if (esp_ping() != ESP_OK)
   {
-    printf("[CLOUD] ESP 无应答 —— 查 PB10/PB11 是否交叉、共地、3V3；"
-           "以及 D1 mini 的 USB 是否还插着\r\n");
-    return;
+    /* 🔴 模块没响应，最常见的原因**不是**接线，而是它还停在上一次的透传里：
+     *    STM32 被复位了（ST-Link / 看门狗 / 手按 RESET），但 ESP8266 的电源
+     *    一直通着，`CIPMODE=1` 的状态也一直在。这时 `AT\r\n` 这 4 个字节会
+     *    直接进 TCP 流，模块根本不解释 ⇒ 永远等不到 "OK"。
+     *    2026-10-25 实测：换成原本跑通的 v13 镜像也报同一句，可见不是固件问题。
+     *    对策就是先发 `+++` 暗号把它拽回指令模式，再重试（最多 2 次，
+     *    每次约 2.2 s，开机阶段可以接受）。 */
+    for (n = 0; (n < 2) && (esp_ping() != ESP_OK); n++)
+    {
+      printf("[CLOUD] AT 无应答，第 %d 次尝试 +++ 逃逸透传（约 2.2 s）...\r\n",
+             n + 1);
+      App_TxqDrain(120U);              /* 让上面这行字先出去，别被 2.2 s 静默拖住 */
+      esp_escape_transparent();
+    }
+    if (esp_ping() != ESP_OK)
+    {
+      printf("[CLOUD] ESP 无应答 —— 查 PB10/PB11 是否交叉、共地、3V3、"
+             "模块是否上电；以及 D1 mini 的 USB 是否还插着\r\n");
+      return;
+    }
+    printf("[CLOUD] ✅ +++ 逃逸成功，模块回到指令模式\r\n");
   }
   (void)esp_echo_off();                /* 关不掉不致命，只是日志吵一倍 */
   App_TxqDrain(300U);

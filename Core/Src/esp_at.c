@@ -45,6 +45,18 @@ static int      s_transparent = 0;
 static char     s_line[LINE_MAX];
 static uint16_t s_line_len = 0;
 
+/* ---- 接收环形缓冲（USART3 中断写入、主循环读出） -------------------
+ * 🔴 为什么必须从"轮询 RXNE"改成中断：115200 下 87 µs 就到下一个字节，
+ *    主循环里任何一次超过 87 µs 的阻塞（单次推理实测 ≈170 µs、日志搬运）
+ *    都会让 DR 被新字节覆盖（ORE）⇒ 收到的字节直接消失。
+ *    2026-10-25 上板实测：上报 8 次、puback 恒为 0，而华为云影子有数据
+ *    ⇒ 上行通、下行(PUBACK 只 4 字节)在轮询间隙被丢光。
+ *    改成 1 字节中断 + 256 B 环形缓冲后，主循环再忙也只是晚点取。 */
+#define ESP_RX_RING   256u
+static volatile uint8_t  s_ring[ESP_RX_RING];
+static volatile uint16_t s_ring_head = 0u;   /* ISR 写 */
+static volatile uint16_t s_ring_tail = 0u;   /* 主循环读 */
+
 #if ESP_AT_DEBUG
 #define DBG(...)  printf(__VA_ARGS__)
 #else
@@ -55,29 +67,70 @@ static uint16_t s_line_len = 0;
 /* 底层读写                                                            */
 /* ------------------------------------------------------------------ */
 
-/** 非阻塞读 1 字节。返回 1 = 读到，0 = 没有 */
+/** 从环形缓冲取 1 字节。返回 1 = 有，0 = 空（**永不阻塞**） */
 static int uart_getc(uint8_t *c)
 {
-    if (s_uart == NULL) {
+    if (s_uart == NULL || c == NULL) {
         return 0;
     }
-    return (HAL_UART_Receive(s_uart, c, 1u, 1u) == HAL_OK) ? 1 : 0;
+    if (s_ring_tail == s_ring_head) {
+        return 0;
+    }
+    *c = s_ring[s_ring_tail];
+    s_ring_tail = (uint16_t)((s_ring_tail + 1u) % ESP_RX_RING);
+    return 1;
+}
+
+/** 环形缓冲里是否有字节 —— 几条指令，纳秒级 */
+static int uart_rx_ready(void)
+{
+    return (s_ring_tail != s_ring_head) ? 1 : 0;
 }
 
 /**
- * @brief 接收寄存器里是否有字节 —— 纯标志位读，纳秒级
+ * @brief USART3 接收中断的**真正实现** —— 直接读寄存器，不经过 HAL
  *
- * 🔴 为什么必须有它：`HAL_UART_Receive(..., 1 byte, timeout=1ms)` 在**没有数据**时
- *    会整整等 1 ms 才返回。主循环里若每次空转都走那条路，1 kHz 采样会直接崩
- *    （每轮丢 1 拍）。所以"非阻塞收包"（timeout = 0）必须先看标志位再决定要不要读，
- *    这样空闲时一次循环只花几个指令周期。
+ * 🔴 为什么不能用 `HAL_UART_Receive_IT()`：它会 `__HAL_LOCK(huart)`。
+ *    而 `uart_put()` 走的是阻塞式 `HAL_UART_Transmit()`，整个发送期间都持有同一把锁。
+ *    模块的应答正好在发送过程中开始到达（115200 下 87 µs/字节），中断里装机必然
+ *    拿到 `HAL_BUSY`、**不重新置位 RXNEIE** ⇒ 从此再也不进中断 ⇒ 表现为
+ *    "AT 无应答"。2026-10-25 实测踩过这个坑（v14 镜像一轮就复现）。
+ *
+ * 所以这里自己读 SR/DR：一次读操作同时清掉 RXNE 与 ORE，绕开 HAL 的状态机与锁。
+ * 调用点：`stm32f4xx_it.c` 的 `USART3_IRQHandler()` 里 **HAL_UART_IRQHandler 之前**。
  */
-static int uart_rx_ready(void)
+void esp_uart3_isr(void)
 {
+    USART_TypeDef *u;
+    uint32_t sr;
+    uint8_t  b;
+    uint16_t nx;
+
     if (s_uart == NULL) {
-        return 0;
+        return;
     }
-    return (__HAL_UART_GET_FLAG(s_uart, UART_FLAG_RXNE) != RESET) ? 1 : 0;
+    u  = s_uart->Instance;
+    sr = u->SR;
+    if ((sr & (USART_SR_RXNE | USART_SR_ORE | USART_SR_FE | USART_SR_NE | USART_SR_PE)) == 0u) {
+        return;
+    }
+    b = (uint8_t)u->DR;                     /* 读 DR 清 RXNE/ORE（溢出也一起清） */
+    if ((sr & USART_SR_RXNE) == 0u) {
+        return;                             /* 只有错误标志、没有新数据 */
+    }
+    nx = (uint16_t)((s_ring_head + 1u) % ESP_RX_RING);
+    if (nx != s_ring_tail) {                /* 满了就丢这个字节（丢新，不覆盖未解析的旧数据） */
+        s_ring[s_ring_head] = b;
+        s_ring_head = nx;
+    }
+}
+
+/** 重新打开接收中断（出错后调用；寄存器级，不碰 HAL 的锁） */
+void esp_rx_restart(void)
+{
+    if (s_uart != NULL) {
+        __HAL_UART_ENABLE_IT(s_uart, UART_IT_RXNE);
+    }
 }
 
 static void uart_put(const uint8_t *buf, uint16_t len)
@@ -208,6 +261,12 @@ void esp_init(UART_HandleTypeDef *huart)
     s_uart = huart;
     s_transparent = 0;
     line_reset();
+    s_ring_head = 0u;
+    s_ring_tail = 0u;
+    /* 只开 RXNEIE（寄存器级）：溢出(ORE)也会经由同一位触发中断，
+     * 由 esp_uart3_isr() 读 DR 一并清掉。不动 HAL 的 RX 状态机，
+     * 因此不会和阻塞发送抢锁。 */
+    __HAL_UART_ENABLE_IT(huart, UART_IT_RXNE);
 }
 
 int esp_is_transparent(void)
@@ -356,21 +415,73 @@ int esp_transparent_recv(uint8_t *buf, uint16_t max_len, uint32_t timeout_ms)
     return (int)n;
 }
 
+/**
+ * @brief 等到"**真正的**静默"：连续 T_SILENCE 毫秒没收到任何字节
+ *
+ * 🔴 为什么不能盲等：`+++` 只在"前后各 1 s 线路上没有数据"时才算暗号。
+ *    光 `HAL_Delay(1100)` 只保证**我们不发**，不保证**模块不说** ——
+ *    模块可能正在把 MCU 复位前排队的东西吐出来（残留 PUBACK、`CLOSED` 等），
+ *    这时那 3 个 `+` 会被当成数据一起塞进 TCP，白费一次机会。
+ *    2026-10-25 实测就有一次要逃逸两次才成，正是这个原因。
+ *
+ * @return 1 = 拿到静默；0 = 超时（超时也照样发 `+++`，多一次机会不亏）
+ */
+static int wait_silence(uint32_t max_ms)
+{
+    uint32_t t0 = HAL_GetTick();
+    uint32_t last = t0;
+    uint8_t  c;
+
+    while ((HAL_GetTick() - t0) < max_ms) {
+        if (uart_getc(&c)) {
+            last = HAL_GetTick();       /* 又来字节了，静默计时重来 */
+            continue;
+        }
+        if ((HAL_GetTick() - last) >= T_SILENCE) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void esp_escape_transparent(void)
+{
+    static const uint8_t plus[3] = { '+', '+', '+' };
+
+    if (s_uart == NULL) {
+        return;
+    }
+    /* 🔴 先把本地标志清掉：这里的前提就是"MCU 侧并不知道模块的真实状态"
+     *    （刚复位过、模块还停在 CIPMODE=1），所以不能靠 s_transparent 判断。 */
+    s_transparent = 0;
+
+    /* ① 等到线路真的安静（顺手把残留字节吃掉，免得被当成 AT 应答） */
+    (void)wait_silence(3000u);
+
+    /* ② 暗号本身 */
+    uart_put(plus, 3u);
+
+    /* ③ 之后也必须静默满 1 s，否则模块不认 */
+    HAL_Delay(T_SILENCE);
+
+    /* ④ 清掉模块可能回的 OK/ERROR/CLOSED，免得污染紧接着的 AT 判定 */
+    line_reset();
+    {
+        uint8_t c;
+        uint32_t t0 = HAL_GetTick();
+        while ((HAL_GetTick() - t0) < 50u) {
+            (void)uart_getc(&c);
+        }
+    }
+}
+
 esp_status_t esp_exit_transparent(void)
 {
-    uint8_t plus[3] = { '+', '+', '+' };
-
     if (!s_transparent) {
         return ESP_OK;
     }
-    /* ①②③ 必须是"静默 1 s → +++ → 静默 1 s"，中间不能有任何其他字节 */
-    HAL_Delay(T_SILENCE);
-    uart_put(plus, 3u);
-    HAL_Delay(T_SILENCE);
-    s_transparent = 0;
-    DBG("    [ESP] 已退出透传\n");
+    esp_escape_transparent();
 
-    /* ④ 用一条 AT 确认真的回到了指令模式（有些固件 +++ 后什么都不回） */
-    line_reset();
+    /* 用一条 AT 确认真的回到了指令模式（有些固件 +++ 后什么都不回） */
     return esp_ping();
 }

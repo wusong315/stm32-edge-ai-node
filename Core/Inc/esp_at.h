@@ -100,4 +100,35 @@ esp_status_t esp_exit_transparent(void);
 /** 是否处于透传模式（调试用） */
 int esp_is_transparent(void);
 
+/**
+ * @brief **开机逃逸**：不管 MCU 自己以为在什么模式，硬发一次 `+++`
+ *
+ * 🔴 为什么必须有：STM32 与 ESP8266 是**两颗独立的芯片**，只有 STM32 会被
+ *    ST-Link / 看门狗 / 手动 RESET 复位，模块的电源一直是通的。上一次运行
+ *    如果进过透传（`CIPMODE=1`），模块就**留在透传里**；新起的 App 一发
+ *    `AT\r\n`，这 4 个字节会直接进 TCP 流，模块不做任何解释
+ *    ⇒ 表现为「AT 超时 / ESP 无应答」，而换回任何旧固件都一样失败
+ *    （2026-10-25 实测踩到：v13 这个原本跑通的镜像也报同一句）。
+ *
+ * 所以启动握手失败时先发暗号把模块拽回指令模式，再重试 `AT`。
+ * 反复多发一次是无害的：已经在指令模式时 `+++` 只是个看不懂的命令。
+ *
+ * @note 阻塞约 2.2 s（前后各 1.1 s 静默，模块只认这个时序）。
+ */
+void esp_escape_transparent(void);
+
+/**
+ * @brief USART3 接收中断实现 —— 由 `USART3_IRQHandler()` 在 HAL 之前调用
+ *
+ * 2026-10-25 起接收改成「1 字节中断 + 256 B 环形缓冲」：
+ * 轮询 RXNE 在 115200 下会丢字节（推理 170 µs 期间就有 2 字节进来），
+ * 4 字节的 PUBACK 丢一个就整包认不出。
+ * 🔴 内部直接读 SR/DR，**不用 HAL_UART_Receive_IT**（那个会和阻塞发送抢 HAL 锁，
+ *    拿不到锁就不再置位 RXNEIE，表现为"AT 无应答"）。
+ */
+void esp_uart3_isr(void);
+
+/** 出错（ORE/FE/NE）后重新装接收，否则再也不进中断 */
+void esp_rx_restart(void);
+
 #endif /* ESP_AT_H */

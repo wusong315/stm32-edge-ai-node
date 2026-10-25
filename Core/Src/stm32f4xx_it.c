@@ -22,6 +22,7 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "esp_at.h"        /* esp_uart3_isr()：USART3 收包走我们自己的环形缓冲 */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -224,6 +225,11 @@ void TIM2_IRQHandler(void)
 void USART3_IRQHandler(void)
 {
   /* USER CODE BEGIN USART3_IRQn 0 */
+
+  /* 🔴 必须在 HAL_UART_IRQHandler 之前：自己读 SR/DR，把字节塞进 esp_at 的
+   *    环形缓冲，并顺手清掉 ORE。HAL 的 IRQ 处理拿不到 RX 状态机（我们没调用
+   *    HAL_UART_Receive_IT），所以它随后只会看到"没有标志位"直接返回。 */
+  esp_uart3_isr();
 
   /* USER CODE END USART3_IRQn 0 */
   HAL_UART_IRQHandler(&huart3);
