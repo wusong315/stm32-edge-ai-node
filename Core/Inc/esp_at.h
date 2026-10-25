@@ -131,4 +131,56 @@ void esp_uart3_isr(void);
 /** 出错（ORE/FE/NE）后重新装接收，否则再也不进中断 */
 void esp_rx_restart(void);
 
+/* ==================================================================
+ * 非阻塞（异步）AT —— 给主循环里的「重连状态机」用
+ * ==================================================================
+ * 🔴 为什么需要另一套：上面那些 `esp_ping()` / `esp_join()` …
+ *    内部都是 `wait_for()` 死等（CWJAP 最长 25 s）。在启动阶段死等没问题
+ *    （那时 1 kHz 节拍还没开始），但**运行期掉线后重连**就不行了 ——
+ *    25 s 的阻塞会把 1 kHz 采样整块吃掉，表现为恒定几百点 lost。
+ *
+ * 用法（每拍只推进一步，绝不阻塞）：
+ *      esp_async_join(ssid, pwd);            // 发出命令，立刻返回
+ *      switch (esp_async_poll()) {           // 主循环里每拍调一次
+ *        case ESP_ASYNC_RUNNING: break;      //  还没结果
+ *        case ESP_ASYNC_OK:      ...         //  成功，进下一步
+ *        default:                ...         //  FAIL / TIMEOUT，走重试
+ *      }
+ */
+typedef enum {
+    ESP_ASYNC_RUNNING = 0,   /* 还没结果 */
+    ESP_ASYNC_OK      = 1,   /* 等到 token（或 OK） */
+    ESP_ASYNC_FAIL    = 2,   /* 收到 ERROR / FAIL / busy p */
+    ESP_ASYNC_TIMEOUT = 3,   /* 超时 */
+    ESP_ASYNC_IDLE    = 4    /* 当前没有在跑的命令 */
+} esp_async_t;
+
+/** 发 `AT` 并开始等待 `OK`。返回 0 = 已发出，<0 = 状态错 */
+int esp_async_ping(void);
+/** 发 `ATE0` */
+int esp_async_echo_off(void);
+/** 发 `AT+CWJAP=`（等 `OK`，超时 25 s） */
+int esp_async_join(const char *ssid, const char *password);
+/** 发 `AT+CIPSTART=`（等 `OK`，超时 10 s） */
+int esp_async_tcp_open(const char *host, uint16_t port);
+/** 发 `AT+CIPMODE=1` */
+int esp_async_cipmode(void);
+/** 发 `AT+CIPSEND`（等 `>`）；收到后调用方须 `esp_set_transparent(1)` */
+int esp_async_cipsend(void);
+
+/** 推进异步命令。每拍调一次，返回值见 `esp_async_t` */
+int esp_async_poll(void);
+
+/** 距离上次收到字节过了多少毫秒；**从没收到过**返回一个很大的值 */
+uint32_t esp_silence_ms(void);
+
+/** 丢掉环形缓冲里未读的字节 + 清行缓冲（切换阶段时用，防止残留污染下一步） */
+void esp_rx_flush(void);
+
+/** 手工设置"本地认为在不在透传"（异步流程自己管状态时用） */
+void esp_set_transparent(int on);
+
+/** 裸发 3 个 `+`（`+++` 暗号）。**静默要求由调用方保证** */
+void esp_send_plus3(void);
+
 #endif /* ESP_AT_H */

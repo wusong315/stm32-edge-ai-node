@@ -128,6 +128,28 @@
 #define CLOUD_SIM_CLEAR       (95U)        /* > 95 才解除异常 —— 迟滞 5 分，防抖 */
 #define CLOUD_MIN_GAP_MS      (5000U)      /* 任意两条上报之间至少 5 s（翻转也不例外） */
 
+/* ---- 重连（2026-10-25 加）--------------------------------------------
+ * 🔴 为什么以前不重连：`CWJAP` + `CIPSTART` + `CIPMODE` 全走 `wait_for()` 死等，
+ *    最长 25 s。放在主循环里会把 1 kHz 采样整块吃掉（恒定几百点 lost）。
+ *    代价是**链路一掉就永久离线** —— 2026-10-25 实测：平台显示"离线"、
+ *    影子停在 `similarity=55`，而板子还在照常发（`puback` 冻结不动）。
+ *
+ * 现在的做法 = **非阻塞状态机**：每拍只推进一步，"阻塞"从设计里消失了。
+ * 所以"建链必须在 TIM2 启动之前"那条老约束也就不再需要了。 */
+/* ⚠️ 这一条故意用 `#ifndef` 包住：它是**唯一**一个"改了就能伪造掉线"的开关。
+ *    自测重连时用 `--variant CLOUD_DOWN_MS=3000` 压到 3 s，就能在
+ *    完全不动网线的前提下，把「判掉线 → 重连 → 重新上线」整条链跑一遍。 */
+#ifndef CLOUD_DOWN_MS
+#define CLOUD_DOWN_MS         (100000U)    /* 下行静默这么久 ⇒ 判掉线（正常最慢 60 s 一个 PINGRESP） */
+#endif
+#define CLOUD_MIN_ONLINE_MS   (20000U)     /* 刚上线这段时间不判掉线（防抖） */
+#define CLOUD_BACKOFF_MIN_MS  (2000U)      /* 第一次失败等 2 s，之后翻倍 */
+#define CLOUD_BACKOFF_MAX_MS  (60000U)
+#define CLOUD_ESC_SILENCE_MS  (1100U)      /* `+++` 前后要求的静默 */
+#define CLOUD_ESC_TRIES       (2U)         /* AT 无应答后最多再逃逸几次 */
+#define CLOUD_BOOT_SETTLE_MS  (1500U)      /* 开机先让模块把手上的事做完，再去敲它 */
+#define CLOUD_CONNACK_MS      (5000U)      /* 发完 CONNECT 等 CONNACK */
+
 #if (APP_CLOUD_ENABLE) && (APP_OUTPUT_MODE != 3)
 #error "APP_CLOUD_ENABLE=1 needs APP_OUTPUT_MODE=3. Fix one of them: (a) build with -DAPP_OUTPUT_MODE=3, or (b) set APP_CLOUD_ENABLE 0 in Core/Inc/secrets.h"
 #endif
@@ -334,6 +356,23 @@ static char       s_topic[96];       /* $oc/devices/<id>/sys/properties/report *
 static mqtt_pkt_t s_pub;             /* 复用的报文缓冲（386 B） */
 static uint16_t   s_pub_id = 1U;     /* QoS1 的 packet id，只用来和 PUBACK 对号 */
 
+/* 云端连接状态机。**每个状态在 App_CloudStep() 里最多干一件小事**，
+ * 绝不阻塞 —— 这是"重连也不能打断 1 kHz 采样"的实现方式。 */
+typedef enum
+{
+  CS_WAIT = 0,      /* 退避等待（失败后） */
+  CS_ESC_SIL,       /* 等线路真正静默，凑 `+++` 的前半个条件 */
+  CS_ESC_SETTLE,    /* 已发 `+++`，等后半个静默 */
+  CS_PING,          /* 发 AT */
+  CS_ECHO,          /* 发 ATE0 */
+  CS_JOIN,          /* 发 AT+CWJAP（最长 25 s，但**非阻塞**） */
+  CS_TCP,           /* 发 AT+CIPSTART */
+  CS_MODE,          /* 发 AT+CIPMODE=1 */
+  CS_SEND,          /* 发 AT+CIPSEND，等 '>' */
+  CS_CONNACK,       /* 已发 MQTT CONNECT，等 4 字节 CONNACK */
+  CS_ONLINE         /* 管道就绪，正常上报 */
+} cloud_state_t;
+
 static struct
 {
   uint8_t  connected;       /* 1 = CONNACK rc=0，管道可用 */
@@ -344,6 +383,17 @@ static struct
   uint32_t errors;          /* 拼包/发送失败次数 */
   uint32_t last_report_ms;  /* 上一条上报的时刻 */
   uint32_t last_tx_ms;      /* 上一次"有字节出去"的时刻（keepalive 计时用） */
+  /* --- 状态机（2026-10-25 加） --- */
+  uint8_t  enabled;         /* 1 = secrets.h 配齐了，状态机才允许跑 */
+  uint8_t  state;           /* cloud_state_t */
+  uint8_t  link_lost;       /* 1 = 收到看不懂的字节（多半是模块吐的 CLOSED） */
+  uint8_t  esc_tries;       /* 本轮 AT 失败后已逃逸几次 */
+  uint32_t t_state;         /* 进入当前状态的时刻 */
+  uint32_t t_esc;           /* 发出 `+++` 的时刻 */
+  uint32_t t_online;        /* 进入 CS_ONLINE 的时刻 */
+  uint32_t backoff;         /* 下一次重试前的等待 */
+  uint32_t reconnects;      /* 重连次数 */
+  uint32_t fails;           /* 建链失败次数 */
 } s_cloud;
 #endif
 
@@ -370,7 +420,9 @@ static void     App_SetDuty(uint8_t pct);
 static void     App_CmdRxStart(void);
 static void     App_PollCmd(void);
 #if (APP_CLOUD_ENABLE)
-static void     App_CloudBegin(void);
+static void     App_CloudStart(void);
+static void     App_CloudStep(uint32_t now);
+static void     App_CloudGoWait(uint32_t now, uint8_t is_failure);
 static void     App_CloudPoll(void);
 static void     App_TxqDrain(uint32_t timeout_ms);
 static void     App_CloudReport(uint8_t sim, uint8_t anomaly);
@@ -1400,9 +1452,13 @@ static void App_CloudDrainRx(void)
 
     if (rl > 4u)
     {
-      /* 我们只订阅了三种定长报文，RL 不可能超过 4 —— 说明已经错位了，
-       * 只能整体丢弃重新找同步点（比逐字节猜安全）。 */
-      printf("[CLOUD] 报文长度异常 rl=%u，清空接收缓冲\r\n", (unsigned)rl);
+      /* 我们只订阅了三种定长报文，RL 不可能超过 4 —— 说明已经错位了。
+       * 🔴 在 ONLINE 状态下，最常见的成因是**模块自己吐了一行文本**：
+       *    TCP 被对端关掉时 ESP8266 会打 `CLOSED`，那 6 个字节在透传里
+       *    和 MQTT 数据混在一起，`0x43`('C') 被当成类型、`0x4C`('L') 被当成
+       *    长度 = 76 ⇒ 落到这里。所以这里不只是"清缓冲"，而是**当成掉线信号**
+       *    交给上层去重连（`s_cloud.link_lost`）。 */
+      s_cloud.link_lost = 1U;
       s_rxn = 0u;
       return;
     }
@@ -1428,8 +1484,7 @@ static void App_CloudDrainRx(void)
         break;
 
       default:                             /* 看不懂就不猜，清空重同步 */
-        printf("[CLOUD] 收到无法识别的报文 0x%02X (rl=%u)，清空接收缓冲\r\n",
-               (unsigned)s_rxb[0], (unsigned)rl);
+        s_cloud.link_lost = 1U;            /* 同上：多半是模块吐的文本，不是 MQTT */
         s_rxn = 0u;
         return;
     }
@@ -1443,11 +1498,347 @@ static void App_CloudDrainRx(void)
   }
 }
 
+/* =====================================================================
+ * 云端连接状态机（2026-10-25）
+ * =====================================================================
+ * 契约：**App_CloudStep() 里每个状态一进入就立刻返回**，不等待任何应答。
+ * 这样主循环每轮只花几微秒，1 kHz 采样一点都不会被吃掉。
+ */
+
+/* 初始化：只把状态机摆到起点，**不建链**（建链交给状态机一步步做）
+ *
+ * 🔴 2026-10-25 之前的写法是"开机一次性阻塞建链"（最长 30 s），
+ *    并且刻意**不做运行期重连**。代价是链路一掉就永久离线，
+ *    平台上看就是"设备一直离线"，而板子本地跑得好好的（`RISKS` R26）。
+ *    改成状态机后，这条老约束"建链必须在 HAL_TIM_Base_Start_IT 之前"
+ *    也一起作废了 —— 没有阻塞，放在哪里都不会吃采样。 */
+static void App_CloudStart(void)
+{
+  /* ---- 参数没配齐就别连 --------------------------------------------
+   * 空字符串会让 AT 变成 `AT+CWJAP="",""`，模块回 ERROR，
+   * 现场看起来像"模块坏了"，其实只是没填 secrets.h。
+   * 🔴 **逐个报是哪一个没填** —— 一句笼统的"未配置"会让人把三行都翻一遍。 */
+  if (CLOUD_WIFI_SSID[0] == '\0')
+  {
+    printf("[CLOUD] 跳过：CLOUD_WIFI_SSID 没填（Core/Inc/secrets.h）\r\n");
+    return;
+  }
+  if (CLOUD_DEVICE_ID[0] == '\0')
+  {
+    printf("[CLOUD] 跳过：CLOUD_DEVICE_ID 没填（Core/Inc/secrets.h）\r\n");
+    return;
+  }
+  if (CLOUD_SECRET[0] == '\0')
+  {
+    printf("[CLOUD] 跳过：CLOUD_SECRET 没填（Core/Inc/secrets.h）\r\n");
+    return;
+  }
+
+  esp_init(&huart3);
+  (void)snprintf(s_topic, sizeof s_topic,
+                 "$oc/devices/%s/sys/properties/report", CLOUD_DEVICE_ID);
+
+  printf("[CLOUD] 目标 %s:%d（非阻塞建链，掉线自动重连）\r\n",
+         CLOUD_HOST, (int)CLOUD_PORT);
+  App_TxqDrain(500U);        /* 开机阶段 1 kHz 节拍还没启动，短暂等是安全的 */
+
+  /* 🔴 起点是 CS_WAIT 而不是 CS_ESC_SIL：给模块 1.5 s 把它正在做的事做完。
+   *    直接进 ESC_SIL 的话，模可能在开机瞬间正吐残留，"静默"判定会被它自己
+   *    的字节不断推迟，或者反过来太早发 `+++` 被当数据吞掉 ——
+   *    实测代价是浪费一整轮重连（12 s）。 */
+  s_cloud.state     = (uint8_t)CS_WAIT;
+  s_cloud.t_state   = HAL_GetTick();
+  s_cloud.backoff   = CLOUD_BOOT_SETTLE_MS;
+  s_cloud.esc_tries = 0U;
+  s_cloud.enabled   = 1U;    /* 🔴 只有走到这里才允许状态机跑 */
+  esp_set_transparent(0);    /* 我们并不知道模块真实状态，一律当"不在透传"处理 */
+}
+
+/**
+ * @brief 进入退避等待（建链失败 or 运行期掉线）
+ * @param is_failure 1 = 建链失败（失败计数 + 退避翻倍）；0 = 掉线（固定短退避）
+ */
+static void App_CloudGoWait(uint32_t now, uint8_t is_failure)
+{
+  s_cloud.connected = 0U;
+  s_cloud.link_lost = 0U;
+
+  if (is_failure != 0U)
+  {
+    s_cloud.fails++;
+    if (s_cloud.backoff == 0U)
+    {
+      s_cloud.backoff = CLOUD_BACKOFF_MIN_MS;
+    }
+    else
+    {
+      s_cloud.backoff *= 2U;
+      if (s_cloud.backoff > CLOUD_BACKOFF_MAX_MS)
+      {
+        s_cloud.backoff = CLOUD_BACKOFF_MAX_MS;
+      }
+    }
+    printf("[CLOUD] 建链失败（累计 %lu 次），%lu ms 后重试\r\n",
+           (unsigned long)s_cloud.fails, (unsigned long)s_cloud.backoff);
+  }
+  else
+  {
+    s_cloud.backoff = CLOUD_BACKOFF_MIN_MS;
+  }
+
+  s_cloud.state   = (uint8_t)CS_WAIT;
+  s_cloud.t_state = now;
+}
+
+/**
+ * @brief 推进一步。**每拍只做一件事，绝不等待。**
+ *
+ * 状态迁移：
+ *   WAIT ──退避到点──> ESC_SIL ──静默够──> ESC_SETTLE ──静默够──> PING
+ *   PING ──OK──> ECHO ──> JOIN ──> TCP ──> MODE ──> SEND ──> CONNACK ──> ONLINE
+ *   任何一步 FAIL/TIMEOUT ──> WAIT（退避重来）
+ */
+static void App_CloudStep(uint32_t now)
+{
+  int st;
+
+  switch (s_cloud.state)
+  {
+    case CS_WAIT:
+      if ((now - s_cloud.t_state) < s_cloud.backoff)
+      {
+        break;
+      }
+      esp_set_transparent(0);
+      s_cloud.esc_tries = 0U;
+      s_cloud.state     = (uint8_t)CS_ESC_SIL;
+      s_cloud.t_state   = now;
+      break;
+
+    case CS_ESC_SIL:
+      /* `+++` 的前半个条件：线路**真的**静默 ≥1.1 s（不是盲等 —— 模块可能
+       * 正在吐复位前排队的残留，那段"忙"会把 3 个 `+` 当数据吞掉）。
+       * 5 s 还等不到静默就硬发一次，多一次机会不亏。 */
+      if ((esp_silence_ms() >= CLOUD_ESC_SILENCE_MS) ||
+          ((now - s_cloud.t_state) >= 5000U))
+      {
+        esp_rx_flush();
+        esp_send_plus3();
+        s_cloud.t_esc = now;
+        s_cloud.state = (uint8_t)CS_ESC_SETTLE;
+      }
+      break;
+
+    case CS_ESC_SETTLE:
+      if ((now - s_cloud.t_esc) >= CLOUD_ESC_SILENCE_MS)
+      {
+        esp_rx_flush();
+        (void)esp_async_ping();
+        s_cloud.state   = (uint8_t)CS_PING;
+        s_cloud.t_state = now;
+      }
+      break;
+
+    case CS_PING:
+      st = esp_async_poll();
+      if (st == (int)ESP_ASYNC_RUNNING)
+      {
+        break;
+      }
+      if (st == (int)ESP_ASYNC_OK)
+      {
+        if (s_cloud.esc_tries > 0U)
+        {
+          printf("[CLOUD] ✅ +++ 逃逸成功，模块回到指令模式\r\n");
+        }
+        (void)esp_async_echo_off();
+        s_cloud.state = (uint8_t)CS_ECHO;
+        break;
+      }
+      /* AT 不通 ⇒ 再逃逸一次；逃逸用尽仍不通 ⇒ 退避重来 */
+      if (s_cloud.esc_tries < CLOUD_ESC_TRIES)
+      {
+        s_cloud.esc_tries++;
+        printf("[CLOUD] AT 无应答，第 %u 次 +++ 逃逸重试\r\n",
+               (unsigned)s_cloud.esc_tries);
+        s_cloud.state   = (uint8_t)CS_ESC_SIL;
+        s_cloud.t_state = now;
+      }
+      else
+      {
+        printf("[CLOUD] ESP 无应答 —— 查 PB10/PB11 是否交叉、共地、3V3、"
+               "模块是否上电；以及 D1 mini 的 USB 是否还插着\r\n");
+        App_CloudGoWait(now, 1U);
+      }
+      break;
+
+    case CS_ECHO:
+      st = esp_async_poll();
+      if (st == (int)ESP_ASYNC_RUNNING)
+      {
+        break;
+      }
+      /* ATE0 失败不致命（只是日志吵一倍），继续往下走 */
+      (void)esp_async_join(CLOUD_WIFI_SSID, CLOUD_WIFI_PASS);
+      s_cloud.state = (uint8_t)CS_JOIN;
+      break;
+
+    case CS_JOIN:
+      st = esp_async_poll();
+      if (st == (int)ESP_ASYNC_RUNNING)
+      {
+        break;
+      }
+      if (st == (int)ESP_ASYNC_OK)
+      {
+        printf("[ESP] Wi-Fi 已连接\r\n");
+        (void)esp_async_tcp_open(CLOUD_HOST, (uint16_t)CLOUD_PORT);
+        s_cloud.state = (uint8_t)CS_TCP;
+      }
+      else
+      {
+        printf("[CLOUD] 连 Wi-Fi 失败 —— 查 SSID/密码、路由器是否 2.4 GHz\r\n");
+        App_CloudGoWait(now, 1U);
+      }
+      break;
+
+    case CS_TCP:
+      st = esp_async_poll();
+      if (st == (int)ESP_ASYNC_RUNNING)
+      {
+        break;
+      }
+      if (st == (int)ESP_ASYNC_OK)
+      {
+        (void)esp_async_cipmode();
+        s_cloud.state = (uint8_t)CS_MODE;
+      }
+      else
+      {
+        printf("[CLOUD] TCP 连接失败 —— 查域名拼写、端口 1883\r\n");
+        App_CloudGoWait(now, 1U);
+      }
+      break;
+
+    case CS_MODE:
+      st = esp_async_poll();
+      if (st == (int)ESP_ASYNC_RUNNING)
+      {
+        break;
+      }
+      if (st == (int)ESP_ASYNC_OK)
+      {
+        (void)esp_async_cipsend();
+        s_cloud.state = (uint8_t)CS_SEND;
+      }
+      else
+      {
+        printf("[CLOUD] AT+CIPMODE=1 失败\r\n");
+        App_CloudGoWait(now, 1U);
+      }
+      break;
+
+    case CS_SEND:
+      st = esp_async_poll();
+      if (st == (int)ESP_ASYNC_RUNNING)
+      {
+        break;
+      }
+      if (st != (int)ESP_ASYNC_OK)
+      {
+        printf("[CLOUD] 进透传失败（CIPSEND 没等到 '>'）\r\n");
+        App_CloudGoWait(now, 1U);
+        break;
+      }
+      /* ---- 进透传成功：此后写出去的字节**就是** MQTT 报文 ---------- */
+      esp_set_transparent(1);
+      esp_rx_flush();              /* 抽掉 "OK"/">" 之类的残留 */
+      {
+        char cid[80];
+        char pw[65];
+
+        if (mqtt_auth_build(CLOUD_DEVICE_ID, CLOUD_SECRET, AUTH_TS, 0U,
+                            cid, sizeof cid, pw, sizeof pw) != 0)
+        {
+          printf("[CLOUD] 鉴权参数非法（device_id 或 ts 长度不对）\r\n");
+          App_CloudGoWait(now, 1U);
+          break;
+        }
+        if (mqtt_encode_connect(&s_pub, cid, CLOUD_DEVICE_ID, pw,
+                                CLOUD_KEEPALIVE_S) == 0U)
+        {
+          printf("[CLOUD] CONNECT 拼包失败（缓冲不够）\r\n");
+          App_CloudGoWait(now, 1U);
+          break;
+        }
+        if (esp_transparent_send(s_pub.buf, s_pub.len) != (int)s_pub.len)
+        {
+          printf("[CLOUD] CONNECT 发送失败\r\n");
+          App_CloudGoWait(now, 1U);
+          break;
+        }
+      }
+      s_rxn           = 0U;
+      s_cloud.state   = (uint8_t)CS_CONNACK;
+      s_cloud.t_state = now;
+      break;
+
+    case CS_CONNACK:
+    {
+      int n = esp_transparent_recv(&s_rxb[s_rxn],
+                                   (uint16_t)(CLOUD_RX_CAP - s_rxn), 0U);
+      if (n > 0)
+      {
+        s_rxn = (uint16_t)(s_rxn + (uint16_t)n);
+      }
+      if (s_rxn >= 4U)
+      {
+        int rc = mqtt_connack_rc(s_rxb, s_rxn);
+        if (rc == 0)
+        {
+          s_cloud.connected      = 1U;
+          s_cloud.link_lost      = 0U;
+          s_cloud.backoff        = 0U;
+          s_cloud.fails          = 0U;
+          s_cloud.esc_tries      = 0U;
+          s_cloud.have_verdict   = 0U;   /* 重连后让第一条立刻发，便于确认 */
+          s_cloud.last_tx_ms     = now;
+          s_cloud.last_report_ms = now;
+          s_cloud.t_online       = now;
+          s_cloud.state          = (uint8_t)CS_ONLINE;
+          printf("[CLOUD] ✅ CONNACK rc=0x00，管道就绪"
+                 "（上报节拍 %u s / 异常 %u s，阈值 sim<%u）\r\n",
+                 (unsigned)(CLOUD_PERIOD_MS / 1000U),
+                 (unsigned)(CLOUD_ALARM_MS / 1000U),
+                 (unsigned)CLOUD_SIM_ALARM);
+        }
+        else
+        {
+          printf("[CLOUD] CONNACK 失败 rc=%d（0x%02X）—— 见 RUNBOOK R14.2 ①\r\n",
+                 rc, (unsigned)s_rxb[3]);
+          App_CloudGoWait(now, 1U);
+        }
+        s_rxn = 0U;
+      }
+      else if ((now - s_cloud.t_state) >= CLOUD_CONNACK_MS)
+      {
+        printf("[CLOUD] 等 CONNACK 超时（平台没回）\r\n");
+        App_CloudGoWait(now, 1U);
+      }
+      break;
+    }
+
+    case CS_ONLINE:
+    default:
+      break;
+  }
+}
+
 /* 主循环里调，**非阻塞、微秒级**。
  *
  * 🔴 这里任何一次阻塞都会直接变成采样丢点（lost 计数），所以：
- *    · 不在这里做 AT 指令、不重连（重连会阻塞 25 s，见 App_CloudBegin 的说明）；
- *    · 接收用 timeout=0，靠 esp_at.c 里的 RXNE 标志位预判，不做 1 ms 忙等；
+ *    · 重连也走状态机（`App_CloudStep` 每拍只推进一步）；
+ *    · 接收用 timeout=0，靠环形缓冲预判，不做 1 ms 忙等；
  *    · 连不上就静默降级（云端不影响采样与推理，这是本项目一贯的取舍）。 */
 static void App_CloudPoll(void)
 {
@@ -1457,12 +1848,48 @@ static void App_CloudPoll(void)
   uint8_t  sim;
   uint8_t  alarm;
 
-  if (s_cloud.connected == 0U)
+  now = HAL_GetTick();
+
+  /* ---- ① 先推状态机（建链 / 重连都在这里，非阻塞） ---- */
+  if (s_cloud.enabled == 0U)
   {
+    return;                        /* 没配 secrets.h / 参数不全 ⇒ 整块不跑 */
+  }
+  App_CloudStep(now);
+
+  if (s_cloud.state != (uint8_t)CS_ONLINE)
+  {
+    return;                        /* 没连上就只跑状态机 */
+  }
+
+  /* ---- ② 收包（PUBACK / PINGRESP，或模块吐的 CLOSED） ---- */
+  App_CloudDrainRx();
+
+  /* ---- ③ 掉线判据 A：字节流里出现了 MQTT 解析不了的东西 ----
+   * 最典型的就是模块自己打的 `CLOSED`（TCP 被对端关掉）。
+   * 这个信号比"静默超时"快得多，所以优先用它。 */
+  if (s_cloud.link_lost != 0U)
+  {
+    s_cloud.reconnects++;
+    printf("[CLOUD] ⚠ 检测到链路中断（模块 CLOSED / 字节流错乱）"
+           "→ 自动重连 #%lu\r\n", (unsigned long)s_cloud.reconnects);
+    App_CloudGoWait(now, 0U);
     return;
   }
 
-  App_CloudDrainRx();
+  /* ---- ④ 掉线判据 B：下行静默太久 ----
+   * 正常情况下最慢 60 s 也会来一个 PINGRESP，所以 100 s 一个字节都没有
+   * 就说明管道已经单向死了（我们还能写、但收不到）—— 那正是 2026-10-25
+   * 现场看到的样子：`puback` 冻结不动、平台判离线。 */
+  if (((now - s_cloud.t_online) >= CLOUD_MIN_ONLINE_MS) &&
+      (esp_silence_ms() >= CLOUD_DOWN_MS))
+  {
+    s_cloud.reconnects++;
+    printf("[CLOUD] ⚠ 下行静默 %lu ms 一个字节都没有 → 判掉线，自动重连 #%lu\r\n",
+           (unsigned long)esp_silence_ms(), (unsigned long)s_cloud.reconnects);
+    App_CloudGoWait(now, 0U);
+    return;
+  }
 
   st = NEAI_AppStats();
   if (st->detect_calls == 0U)
@@ -1472,7 +1899,6 @@ static void App_CloudPoll(void)
     return;
   }
 
-  now   = HAL_GetTick();
   sim   = st->last_similarity;
 
   /* 🔴 迟滞（hysteresis）：进异常用 90，退异常要回到 95 以上。
@@ -1526,148 +1952,6 @@ static void App_CloudPoll(void)
   }
 }
 
-/* 启动阶段一次性把管道建起来（**阻塞**，最长约 30 s）。
- *
- * 🔴 必须在上面的 `HAL_TIM_Base_Start_IT(&htim2)` **之前**调用：
- *    这里会阻塞几秒到几十秒（等 DHCP、等 CONNACK），而 g_tick 一旦开始走，
- *    这段时间的全部拍子都会被记成 lost —— 上板验收会看到恒定的几百点丢失，
- *    然后花半天去查 I2C。放在启动节拍之前，这问题根本不存在。
- *
- * 🔴 失败**不影响**采样与推理：云端只是"多一条数据出口"，
- *    不是运行的前提。连不上就打印原因、置 connected=0、继续跑模式 3。
- *    （自动重连留给 T10 的后续：重连要 25 s，会阻塞采样，得做成状态机，
- *      这一轮不做 —— 现在先保证"能连上、能上报、能看到数"。） */
-static void App_CloudBegin(void)
-{
-  char     cid[80];
-  char     pw[65];
-  int      n;
-  int      rc;
-  uint8_t  rx[16];
-
-  /* ---- 参数没配齐就别连 --------------------------------------------
-   * 空字符串会让 AT 变成 `AT+CWJAP="",""`，模块回 ERROR，
-   * 现场看起来像"模块坏了"，其实只是没填 secrets.h。
-   * 🔴 **逐个报是哪一个没填** —— 一句笼统的"未配置"会让人把三行都翻一遍。 */
-  if (CLOUD_WIFI_SSID[0] == '\0')
-  {
-    printf("[CLOUD] 跳过：CLOUD_WIFI_SSID 没填（Core/Inc/secrets.h）\r\n");
-    return;
-  }
-  if (CLOUD_DEVICE_ID[0] == '\0')
-  {
-    printf("[CLOUD] 跳过：CLOUD_DEVICE_ID 没填（Core/Inc/secrets.h）\r\n");
-    return;
-  }
-  if (CLOUD_SECRET[0] == '\0')
-  {
-    printf("[CLOUD] 跳过：CLOUD_SECRET 没填（Core/Inc/secrets.h）\r\n");
-    return;
-  }
-
-  printf("[CLOUD] 连接 %s:%d ...\r\n", CLOUD_HOST, (int)CLOUD_PORT);
-  App_TxqDrain(3000U);                 /* 先把启动横幅倒干净，理由见上 */
-
-  /* ---- ① AT 握手 --------------------------------------------------- */
-  esp_init(&huart3);
-  if (esp_ping() != ESP_OK)
-  {
-    /* 🔴 模块没响应，最常见的原因**不是**接线，而是它还停在上一次的透传里：
-     *    STM32 被复位了（ST-Link / 看门狗 / 手按 RESET），但 ESP8266 的电源
-     *    一直通着，`CIPMODE=1` 的状态也一直在。这时 `AT\r\n` 这 4 个字节会
-     *    直接进 TCP 流，模块根本不解释 ⇒ 永远等不到 "OK"。
-     *    2026-10-25 实测：换成原本跑通的 v13 镜像也报同一句，可见不是固件问题。
-     *    对策就是先发 `+++` 暗号把它拽回指令模式，再重试（最多 2 次，
-     *    每次约 2.2 s，开机阶段可以接受）。 */
-    for (n = 0; (n < 2) && (esp_ping() != ESP_OK); n++)
-    {
-      printf("[CLOUD] AT 无应答，第 %d 次尝试 +++ 逃逸透传（约 2.2 s）...\r\n",
-             n + 1);
-      App_TxqDrain(120U);              /* 让上面这行字先出去，别被 2.2 s 静默拖住 */
-      esp_escape_transparent();
-    }
-    if (esp_ping() != ESP_OK)
-    {
-      printf("[CLOUD] ESP 无应答 —— 查 PB10/PB11 是否交叉、共地、3V3、"
-             "模块是否上电；以及 D1 mini 的 USB 是否还插着\r\n");
-      return;
-    }
-    printf("[CLOUD] ✅ +++ 逃逸成功，模块回到指令模式\r\n");
-  }
-  (void)esp_echo_off();                /* 关不掉不致命，只是日志吵一倍 */
-  App_TxqDrain(300U);
-
-  /* ---- ② 连 Wi-Fi（最长 25 s，DHCP 慢的时候真的会到 10 s 以上）------ */
-  if (esp_join(CLOUD_WIFI_SSID, CLOUD_WIFI_PASS) != ESP_OK)
-  {
-    printf("[CLOUD] 连 Wi-Fi 失败 —— 查 SSID/密码、路由器是否 2.4 GHz\r\n");
-    return;
-  }
-  App_TxqDrain(500U);
-
-  /* ---- ③ 建 TCP -------------------------------------------------- */
-  if (esp_tcp_open(CLOUD_HOST, (uint16_t)CLOUD_PORT) != ESP_OK)
-  {
-    printf("[CLOUD] TCP 连接失败 —— 查域名拼写、端口 1883\r\n");
-    return;
-  }
-  App_TxqDrain(500U);
-
-  /* ---- ④ 进透传：此后写出去的字节**就是** MQTT 报文 ---------------- */
-  if (esp_enter_transparent() != ESP_OK)
-  {
-    printf("[CLOUD] 进透传失败（CIPMODE/CIPSEND）\r\n");
-    return;
-  }
-
-  /* ---- ⑤ 拼 CONNECT 并发出去 -------------------------------------- */
-  if (mqtt_auth_build(CLOUD_DEVICE_ID, CLOUD_SECRET, AUTH_TS, 0U,
-                      cid, sizeof cid, pw, sizeof pw) != 0)
-  {
-    printf("[CLOUD] 鉴权参数非法（device_id 或 ts 长度不对）\r\n");
-    return;
-  }
-  if (mqtt_encode_connect(&s_pub, cid, CLOUD_DEVICE_ID, pw,
-                          CLOUD_KEEPALIVE_S) == 0U)
-  {
-    printf("[CLOUD] CONNECT 拼包失败（缓冲不够）\r\n");
-    return;
-  }
-  if (esp_transparent_send(s_pub.buf, s_pub.len) != (int)s_pub.len)
-  {
-    printf("[CLOUD] CONNECT 发送失败\r\n");
-    return;
-  }
-
-  /* ---- ⑥ 等 CONNACK ----------------------------------------------
-   * 实测 4 字节 `20 02 00 00`。rc 的含义见 mqtt_pkt.h：
-   *   0x00 成功 / 0x02 clientId 或 keepalive 非法 / 0x04 用户名密码错 / 0x05 未授权 */
-  n = esp_transparent_recv(rx, (uint16_t)sizeof rx, 5000U);
-  if (n <= 0)
-  {
-    printf("[CLOUD] 等 CONNACK 超时（平台没回）\r\n");
-    return;
-  }
-  rc = mqtt_connack_rc(rx, (uint16_t)n);
-  if (rc != 0)
-  {
-    printf("[CLOUD] CONNACK 失败 rc=%d（0x%02X）—— 见 RUNBOOK R14.2 ①\r\n",
-           rc, (n >= 4) ? (unsigned)rx[3] : 0U);
-    return;
-  }
-
-  /* ---- ⑦ 记账，准备上报 ------------------------------------------- */
-  (void)snprintf(s_topic, sizeof s_topic,
-                 "$oc/devices/%s/sys/properties/report", CLOUD_DEVICE_ID);
-  s_cloud.connected      = 1U;
-  s_cloud.last_tx_ms     = HAL_GetTick();   /* CONNECT 本身也算一次活动 */
-  s_cloud.last_report_ms = s_cloud.last_tx_ms;
-
-  printf("[CLOUD] ✅ CONNACK rc=0x00，管道就绪"
-         "（上报节拍 %u s / 异常 %u s，阈值 sim<%u）\r\n",
-         (unsigned)(CLOUD_PERIOD_MS / 1000U), (unsigned)(CLOUD_ALARM_MS / 1000U),
-         (unsigned)CLOUD_SIM_ALARM);
-}
 #endif /* APP_CLOUD_ENABLE */
 
 /* USER CODE END 0 */
@@ -1757,11 +2041,12 @@ int main(void)
   NEAI_AppInit();
 
 #if (APP_CLOUD_ENABLE)
-  /* ---- 第 ⑧ 步：建云端管道（🔴 必须在启动 1 kHz 节拍之前）-----------
-   * 这一步会阻塞几秒到三十秒（DHCP + CONNACK）。放在 TIM2 启动**之前**，
-   * 这段等待就完全不计入采样丢失；放在之后，会看到一块固定的 lost 尖峰，
-   * 然后被误判成 I2C 问题。失败也不影响采样与推理（内部自己降级）。 */
-  App_CloudBegin();
+  /* ---- 第 ⑧ 步：把云端状态机摆到起点（**不建链**）-------------------
+   * 2026-10-25 起建链改成**非阻塞状态机**，在 App_CloudPoll() 里每拍推进一步。
+   * 所以这里不再有"必须放在 TIM2 启动之前"的约束（那条约束原本是为了
+   * 避免 25 s 阻塞被记成 lost）。放在这里只是为了让日志顺序好看。
+   * 失败/掉线都不影响采样与推理 —— 云端只是"多一条数据出口"。 */
+  App_CloudStart();
 #endif
 
   /* ---- 启动 1 kHz 采样节拍 ------------------------------------------

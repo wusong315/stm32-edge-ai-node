@@ -56,6 +56,7 @@ static uint16_t s_line_len = 0;
 static volatile uint8_t  s_ring[ESP_RX_RING];
 static volatile uint16_t s_ring_head = 0u;   /* ISR 写 */
 static volatile uint16_t s_ring_tail = 0u;   /* 主循环读 */
+static volatile uint32_t s_last_rx_tick = 0u;/* 最近一次收到字节的时刻（ISR 维护） */
 
 #if ESP_AT_DEBUG
 #define DBG(...)  printf(__VA_ARGS__)
@@ -122,6 +123,7 @@ void esp_uart3_isr(void)
     if (nx != s_ring_tail) {                /* 满了就丢这个字节（丢新，不覆盖未解析的旧数据） */
         s_ring[s_ring_head] = b;
         s_ring_head = nx;
+        s_last_rx_tick = HAL_GetTick();     /* 记"最后一次收到"的时刻，供静默判定 */
     }
 }
 
@@ -263,6 +265,12 @@ void esp_init(UART_HandleTypeDef *huart)
     line_reset();
     s_ring_head = 0u;
     s_ring_tail = 0u;
+    /* 🔴 把"最后一次收到字节"锚在初始化时刻，而不是留 0。
+     *    留 0 的话 `esp_silence_ms()` 会走哨兵分支返回"很久很久"，
+     *    于是状态机一上来就以为线路早就静默好了、立刻发 `+++` ——
+     *    而模块可能正忙着吐上一次的残留，3 个 `+` 会被当数据吞掉，
+     *    白白浪费一整轮重连（2026-10-25 实测：多花 12 s）。 */
+    s_last_rx_tick = HAL_GetTick();
     /* 只开 RXNEIE（寄存器级）：溢出(ORE)也会经由同一位触发中断，
      * 由 esp_uart3_isr() 读 DR 一并清掉。不动 HAL 的 RX 状态机，
      * 因此不会和阻塞发送抢锁。 */
@@ -484,4 +492,166 @@ esp_status_t esp_exit_transparent(void)
 
     /* 用一条 AT 确认真的回到了指令模式（有些固件 +++ 后什么都不回） */
     return esp_ping();
+}
+
+/* ------------------------------------------------------------------ */
+/* 非阻塞（异步）AT —— 运行期重连用                                    */
+/* ------------------------------------------------------------------ */
+
+#define ESP_CMD_MAX 160
+
+static char        s_cmd[ESP_CMD_MAX];
+static const char *s_async_tok = NULL;
+static uint32_t    s_async_dl  = 0u;
+static uint32_t    s_async_tmo = 0u;
+static uint8_t     s_async_run = 0u;
+
+uint32_t esp_silence_ms(void)
+{
+    if (s_last_rx_tick == 0u) {
+        return 0x7FFFFFFFu;      /* 开机以来一个字节都没收到过 ⇒ 当作很久 */
+    }
+    return HAL_GetTick() - s_last_rx_tick;
+}
+
+void esp_rx_flush(void)
+{
+    /* 单写者（ISR 只动 head）⇒ 直接把 tail 追上去即可，不用关中断 */
+    s_ring_tail = s_ring_head;
+    line_reset();
+}
+
+void esp_set_transparent(int on)
+{
+    s_transparent = on ? 1 : 0;
+}
+
+void esp_send_plus3(void)
+{
+    static const uint8_t plus[3] = { '+', '+', '+' };
+    if (s_uart == NULL) {
+        return;
+    }
+    uart_put(plus, 3u);
+}
+
+/**
+ * @brief 发出命令并开始计时。**立刻返回**，结果靠 `esp_async_poll()` 取。
+ * @return 0 = 已发出；<0 = 状态错（没 init / 正在透传）
+ */
+static int async_start(const char *cmd, const char *token, uint32_t timeout_ms)
+{
+    if (s_uart == NULL || cmd == NULL) {
+        return -1;
+    }
+    if (s_transparent) {
+        /* 透传里发 AT 会直接进 TCP，必须挡住（与 at_cmd 一致） */
+        DBG("    [ESP] ✗ 透传模式下拒绝发送 AT：%s\n", cmd);
+        return -1;
+    }
+    esp_rx_flush();               /* 清掉上一条的残留应答 */
+    s_async_tok = token;
+    s_async_tmo = timeout_ms;
+    s_async_dl  = HAL_GetTick() + timeout_ms;
+    s_async_run = 1u;
+    DBG("    [ESP] -> %s\n", cmd);
+    uart_puts(cmd);
+    uart_puts("\r\n");
+    return 0;
+}
+
+int esp_async_poll(void)
+{
+    uint8_t  c;
+    uint16_t guard = 0u;
+
+    if (s_async_run == 0u) {
+        return ESP_ASYNC_IDLE;
+    }
+
+    /* 🔴 匹配必须在"换行清缓冲"之前做 —— 与 `wait_for()` 同一个坑：
+     *    `OK\r\n` 的 `\n` 一到 line_feed 就把缓冲清了，
+     *    先清后匹配的话 `line_has("OK")` 永远为假，表现为"每条 AT 都超时"。 */
+    while ((guard++ < (uint16_t)ESP_RX_RING) && uart_getc(&c)) {
+        if (c == '\r') {
+            continue;
+        }
+        if (c == '\n') {
+            line_feed('\n');       /* 只负责打印 + 清空 */
+            continue;
+        }
+        if (s_line_len < (uint16_t)(LINE_MAX - 1u)) {
+            s_line[s_line_len++] = (char)c;
+            s_line[s_line_len] = '\0';
+        }
+        if (line_has("ERROR") || line_has("FAIL") || line_has("busy p")) {
+            s_async_run = 0u;
+            DBG("    [ESP] <- 失败关键字：%s\n", s_line);
+            return ESP_ASYNC_FAIL;
+        }
+        if (s_async_tok != NULL) {
+            if (line_has(s_async_tok)) {
+                s_async_run = 0u;
+                return ESP_ASYNC_OK;
+            }
+        } else if (line_has("OK")) {
+            s_async_run = 0u;
+            return ESP_ASYNC_OK;
+        }
+    }
+
+    if ((int32_t)(HAL_GetTick() - s_async_dl) >= 0) {
+        s_async_run = 0u;
+        DBG("    [ESP] <- 超时 %lu ms（等 \"%s\"）\n",
+            (unsigned long)s_async_tmo, s_async_tok ? s_async_tok : "OK");
+        return ESP_ASYNC_TIMEOUT;
+    }
+    return ESP_ASYNC_RUNNING;
+}
+
+int esp_async_ping(void)
+{
+    return async_start("AT", "OK", T_AT);
+}
+
+int esp_async_echo_off(void)
+{
+    return async_start("ATE0", "OK", T_AT);
+}
+
+int esp_async_join(const char *ssid, const char *password)
+{
+    if (ssid == NULL || password == NULL) {
+        return -1;
+    }
+    if ((uint32_t)strlen(ssid) + (uint32_t)strlen(password) + 20u > sizeof s_cmd) {
+        return -1;
+    }
+    (void)snprintf(s_cmd, sizeof s_cmd, "AT+CWJAP=\"%s\",\"%s\"", ssid, password);
+    /* 成功回 "WIFI GOT IP" + "OK"；失败回 "+CWJAP:<code>" + "FAIL" */
+    return async_start(s_cmd, "OK", T_CWJAP);
+}
+
+int esp_async_tcp_open(const char *host, uint16_t port)
+{
+    if (host == NULL) {
+        return -1;
+    }
+    if ((uint32_t)strlen(host) + 32u > sizeof s_cmd) {
+        return -1;
+    }
+    (void)snprintf(s_cmd, sizeof s_cmd,
+                   "AT+CIPSTART=\"TCP\",\"%s\",%u", host, (unsigned)port);
+    return async_start(s_cmd, "OK", T_CIPSTART);
+}
+
+int esp_async_cipmode(void)
+{
+    return async_start("AT+CIPMODE=1", "OK", T_AT);
+}
+
+int esp_async_cipsend(void)
+{
+    /* 无参数 ⇒ 进透传，模块回一行提示 + '>' */
+    return async_start("AT+CIPSEND", ">", T_CIPSEND);
 }
