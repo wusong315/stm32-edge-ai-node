@@ -27,6 +27,7 @@
 #include "esp_at.h"
 #include <stdio.h>
 #include <string.h>
+#include <math.h>          /* sqrtf —— 逐窗交流 RMS（判停机用） */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -149,6 +150,39 @@
 #define CLOUD_ESC_TRIES       (2U)         /* AT 无应答后最多再逃逸几次 */
 #define CLOUD_BOOT_SETTLE_MS  (1500U)      /* 开机先让模块把手上的事做完，再去敲它 */
 #define CLOUD_CONNACK_MS      (5000U)      /* 发完 CONNECT 等 CONNACK */
+
+/* ---- 停机判定 + 判定去抖（2026-10-25 加）----------------------------
+ * 🔴 停机为什么要单独判：训练集只有 `normal_d100`（电机在跑），**停机段属 OOD**
+ *    （`T14` 实测 14.9 % 的停机窗口被判异常）。不挡住的话，机器一停云端就刷
+ *    "异常"，看起来像误报，其实是模型根本没学过静止工况。
+ *
+ * 门槛 0.013 g 的依据（离线用 5 段已有数据算的「逐 128 窗三轴**交流** RMS」，
+ * 脚本 `_tmp/still_gate.py`）：
+ *     停机（正对照）   max 0.00913   p50 0.00674
+ *     normal_d100      min 0.01936   p50 0.02163
+ *     新电池两轮        min 0.05300 / 0.06139
+ *     修好供电          min 0.03212
+ *  ⇒ 0.013 落在「停机最高」与「额定最低」之间，**上下各留约 1.45 倍余量**。
+ * ⚠️ 必须用**交流**（去直流）：重力在 az 上有约 1 g 的直流分量，
+ *    直接用 RMS 的话停机和额定都会顶到 ~1 g，两边完全重合（这是最容易踩的坑）。 */
+#ifndef CLOUD_STILL_RMS
+#define CLOUD_STILL_RMS       (0.013f)
+#endif
+
+/* 判定去抖：连续 N 个窗口都想翻，才真的翻。
+ *
+ * N 是**实测选出来的**，不是拍的。`d100` 跑 120 s / 839 窗，逐窗统计「连续 <90」的串长：
+ *     串长 1 窗 18 次 / 2 窗 5 次 / 3 窗 2 次
+ * 用同一段数据离线模拟不同 N 造成的判定翻转次数：
+ *     N=2 → 14 次    N=3 → 4 次    **N=4 → 0 次**
+ * ⇒ 取 4 才能把「正常工况下的误报」清零。代价是判定延迟 +0.51 s
+ *   （4 窗 × 128 ms），对"不平衡"这类**持续**故障毫无影响；
+ *   ⚠️ 但**短暂冲击**更难检出（`T14` 的外部冲击 13.6 % 是单次瞬态，
+ *      改 N 之后这个数字需要在 R10.10 重新测，别直接沿用）。 */
+#ifndef CLOUD_DEBOUNCE_WIN
+#define CLOUD_DEBOUNCE_WIN    (4U)
+#endif
+
 
 #if (APP_CLOUD_ENABLE) && (APP_OUTPUT_MODE != 3)
 #error "APP_CLOUD_ENABLE=1 needs APP_OUTPUT_MODE=3. Fix one of them: (a) build with -DAPP_OUTPUT_MODE=3, or (b) set APP_CLOUD_ENABLE 0 in Core/Inc/secrets.h"
@@ -394,7 +428,18 @@ static struct
   uint32_t backoff;         /* 下一次重试前的等待 */
   uint32_t reconnects;      /* 重连次数 */
   uint32_t fails;           /* 建链失败次数 */
+  uint32_t last_detect;     /* 上一次看到的 detect_calls（用来识别"新窗口"） */
+  uint8_t  pend_cnt;        /* 去抖：连续几个窗口想翻转 */
 } s_cloud;
+
+/* 逐窗交流 RMS 的累加器（判"停机"用，见 CLOUD_STILL_RMS 的说明）。
+ * 每拍 3 乘 6 加，1 kHz 下开销可忽略；窗口结束时开一次方（≈7.8 次/秒）。 */
+static float    g_ac_sum[3];
+static float    g_ac_sumsq[3];
+static uint16_t g_ac_n   = 0U;
+static float    g_ac_rms = 0.0f;      /* 最近一个窗口的三轴交流 RMS（单位 g） */
+static uint32_t g_still_win = 0U;     /* 被判成"停机"的窗口数（调试用） */
+
 #endif
 
 /* USER CODE END PV */
@@ -828,6 +873,39 @@ static void App_SyncTickBaseline(void)
   g_sample_lost = 0U;
 }
 
+#if (APP_CLOUD_ENABLE)
+/* 一个 128 点窗口攒满时调一次：把累加器换算成「三轴交流 RMS」。
+ *
+ * 为什么是"方差相加再开方"而不是逐轴 RMS：
+ *   ① 必须去掉直流（重力约 1 g），否则停机和额定都顶到 ~1 g，完全分不开；
+ *   ② 方差和对安装朝向不变 ⇒ 换个姿态也不用重新标门槛。 */
+static void App_AcRmsUpdate(void)
+{
+  float    var = 0.0f;
+  uint16_t k;
+
+  if (g_ac_n < 8U)
+  {
+    return;                     /* 半窗（掉线/重启）不算，免得门槛误判 */
+  }
+  for (k = 0U; k < 3U; k++)
+  {
+    float mean = g_ac_sum[k] / (float)g_ac_n;
+    float ms   = g_ac_sumsq[k] / (float)g_ac_n;
+    float v    = ms - (mean * mean);
+    if (v > 0.0f)
+    {
+      var += v;                 /* 数值噪声可能让 v 微负，跳过即可 */
+    }
+  }
+  g_ac_rms = sqrtf(var);
+
+  g_ac_sum[0] = g_ac_sum[1] = g_ac_sum[2] = 0.0f;
+  g_ac_sumsq[0] = g_ac_sumsq[1] = g_ac_sumsq[2] = 0.0f;
+  g_ac_n = 0U;
+}
+#endif
+
 /* 只处理“最新”那一拍；若主循环没跟上（pending > 1），把丢掉的拍数记下来。
  * 模式 2 下还要额外作废当前半帧 —— 有断层的数据不能当作连续序列喂给 AI。 */
 static void App_OnTick(void)
@@ -1044,7 +1122,28 @@ static void App_OnTick(void)
 
     /* 返回值这里不用：日志由 neai_app 自己按节流打印。
      * 将来做"异常告警点灯"时，在这里判 NEAI_PUSH_DETECTED + 相似度阈值即可。 */
+#if (APP_CLOUD_ENABLE)
+    /* 顺手累加"逐窗交流 RMS"的原料（判停机用，见 CLOUD_STILL_RMS）。
+     * 就在喂模型这一个点上做，不额外开一路采样，也不影响喂进去的数据。 */
+    {
+      uint16_t k2;
+      for (k2 = 0U; k2 < 3U; k2++)
+      {
+        g_ac_sum[k2]   += xyz[k2];
+        g_ac_sumsq[k2] += xyz[k2] * xyz[k2];
+      }
+      g_ac_n++;
+    }
+    {
+      uint8_t r = NEAI_AppPushSample(xyz);
+      if ((r == NEAI_PUSH_DETECTED) || (r == NEAI_PUSH_LEARNED))
+      {
+        App_AcRmsUpdate();      /* 窗口刚好结束 ⇒ 算一次 */
+      }
+    }
+#else
     (void)NEAI_AppPushSample(xyz);
+#endif
   }
 
   /* 每秒一行汇总（心跳 + 健康度） */
@@ -1802,6 +1901,8 @@ static void App_CloudStep(uint32_t now)
           s_cloud.fails          = 0U;
           s_cloud.esc_tries      = 0U;
           s_cloud.have_verdict   = 0U;   /* 重连后让第一条立刻发，便于确认 */
+          s_cloud.pend_cnt       = 0U;   /* 去抖从头开始 */
+          s_cloud.last_detect    = NEAI_AppStats()->detect_calls;
           s_cloud.last_tx_ms     = now;
           s_cloud.last_report_ms = now;
           s_cloud.t_online       = now;
@@ -1906,6 +2007,7 @@ static void App_CloudPoll(void)
    *    2026-10-25 上板实测：60 s 内发了 **75 条**上报（按 30 s 节拍应该是 2 条），
    *    既打爆链路也打爆平台配额，日志还被刷得看不见别的。
    *    迟滞 + 下面的最小间隔一起解决这个问题。 */
+  /* ① 先按迟滞算出"这一窗想给什么判定" */
   if (s_cloud.alarm != 0U)
   {
     alarm = (sim > CLOUD_SIM_CLEAR) ? 0U : 1U;
@@ -1915,24 +2017,66 @@ static void App_CloudPoll(void)
     alarm = (sim < CLOUD_SIM_ALARM) ? 1U : 0U;
   }
 
-  /* ① 第一条：立刻发，让平台一上电就有数 */
-  if (s_cloud.have_verdict == 0U)
+  /* ② 停机覆盖：机器根本没转 ⇒ 一律不判异常，并且**不参与去抖**。
+   *
+   * 🔴 训练集只有 `normal_d100`（电机在跑），停机段属 OOD（`T14`：14.9 %
+   *    的停机窗口会被判异常）。不挡住的话，机器一停云端就刷"异常"，
+   *    看着像误报，其实是模型没见过静止工况。 */
+  if (g_ac_rms < CLOUD_STILL_RMS)
   {
-    App_CloudReport(sim, alarm);
-    return;
+    alarm = 0U;
+    g_still_win++;
+    s_cloud.pend_cnt = 0U;          /* 停机不算"想翻转" */
   }
 
-  /* ② 判定翻转 → 尽快发（演示时"异常秒出"靠这一条），
-   *    但受最小间隔约束：真实振动信号会在门槛附近来回跳，
-   *    不设下限的话"秒出"就变成"每秒一条"。 */
-  if ((alarm != s_cloud.alarm) &&
-      ((now - s_cloud.last_report_ms) >= CLOUD_MIN_GAP_MS))
+  /* ③ 判定去抖：连续 N 个窗口都想翻，才真的翻。
+   *
+   * 🔴 为什么需要：`d100` 下实测仍有 0.8 % 的**孤立单窗尖峰**（min 50），
+   *    而「连续 <90」的最长连串只有 **1 窗**。每个尖峰会造成"翻出 + 翻回"
+   *    两条上报 ⇒ 90 s 里 8 条（4 尖峰 × 2），云上看就是 normal/anomaly 乱跳。
+   *    N=2 就能把这些全部消掉，代价只是检测延迟 +0.13 s。 */
   {
-    App_CloudReport(sim, alarm);
-    return;
+    uint8_t changed = 0U;
+
+    if ((s_cloud.have_verdict != 0U) &&
+        (st->detect_calls != s_cloud.last_detect))
+    {
+      s_cloud.last_detect = st->detect_calls;      /* 有新窗口了，才判一次 */
+      if (alarm != s_cloud.alarm)
+      {
+        s_cloud.pend_cnt++;
+        if (s_cloud.pend_cnt >= CLOUD_DEBOUNCE_WIN)
+        {
+          s_cloud.alarm  = alarm;                  /* 确认翻转 */
+          s_cloud.pend_cnt = 0U;
+          changed        = 1U;
+        }
+      }
+      else
+      {
+        s_cloud.pend_cnt = 0U;
+      }
+    }
+    alarm = s_cloud.alarm;     /* 未确认前一律沿用上一次已上报的判定 */
+
+    /* ④ 第一条：立刻发，让平台一上电就有数 */
+    if (s_cloud.have_verdict == 0U)
+    {
+      App_CloudReport(sim, alarm);
+      return;
+    }
+
+    /* ⑤ 判定**确认**翻转 → 尽快发（演示时"异常秒出"靠这一条），
+     *    但受最小间隔约束：不设下限的话"秒出"会变成"每秒一条"。 */
+    if ((changed != 0U) &&
+        ((now - s_cloud.last_report_ms) >= CLOUD_MIN_GAP_MS))
+    {
+      App_CloudReport(sim, alarm);
+      return;
+    }
   }
 
-  /* ③ 持续同一判定 → 按节拍发（正常 30 s / 异常 60 s） */
+  /* ⑥ 持续同一判定 → 按节拍发（正常 30 s / 异常 60 s） */
   period = (alarm != 0U) ? CLOUD_ALARM_MS : CLOUD_PERIOD_MS;
   if ((now - s_cloud.last_report_ms) >= period)
   {
@@ -1940,7 +2084,7 @@ static void App_CloudPoll(void)
     return;
   }
 
-  /* ④ 兜底心跳：万一长时间没发任何东西（比如相似度一直没更新），
+  /* ⑦ 兜底心跳：万一长时间没发任何东西（比如相似度一直没更新），
    *    keepalive 到期会被平台踢（实测 ≈1.5 倍 keepalive）。 */
   if ((now - s_cloud.last_tx_ms) >= CLOUD_PING_MS)
   {
