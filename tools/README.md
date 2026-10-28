@@ -36,6 +36,7 @@ D:\STM32Projects\pc-venv\Scripts\python.exe
 | `ota_send.py` | **串口升级（OTA / `S6`）**：把一份 `.bin` 分包灌进 **Bootloader 的 Slot B**，停等重传 + 全程打印设备日志 + **升级后自动判定 8 条判据**；`--selftest` 帧格式固定向量、`--dry-run` 只算不发、`--corrupt N` 造坏帧（给 `S7`/`S8`）、`--expect-rollback` 换回滚判据、`--confirm` 发 `k` 确认、**`--silent-app` 换"数二进制帧"判据（给 mode 2/3 这种不打字的 App）**、`--stlink-reset` 省得手按 RESET |
 | `bench_stall.py` | **采集健康度门禁**：帧间隔停顿 + 固件计数器增量**一次原子测量**（把「读数→采 60 s→读数」绑成同一次，避免拿两次不同采集的数字对比）；判据 = 停顿 0 次 / 完整度 ≥99.5 % / 掉线 0；`--print-addrs` 列出所需的 RAM 符号地址 |
 | `to_neai_csv.py` | **Studio 导入格式转换**：把连续序列 CSV 切成「**每行一个信号**」（列 = 窗长 × 3 轴），默认按轴拼接 + **去掉每轴直流**（直流由装夹角度决定、比振动大两个数量级）。`--layout point-major` / `--unit lsb` / `--keep-dc` 三个开关对齐 Studio 的约定；`--dry-run` 先看窗数与形态，`--verify` 写完读回逐元素比对；产物旁自动落 `*.manifest.json` |
+| `iotda_shadow_check.py` | **云端影子 ↔ 串口日志对账**（末值 + 条数）：`puback` 只能证明"平台收到了字节"，证明不了"收的内容对"。本工具把影子里的 `similarity`/`verdict` 跟串口最后一条 `[CLOUD] #N` 对上。`--emit-template` 出影子骨架、`--shadow -` 从 stdin 读、`--serial COM5` 直接录；`--selftest` 离线 18 条断言 |
 | `selftest.py` | **自测**：331 条断言，不需要硬件 |
 
 ## 先跑自测（每次改完代码都该跑）
@@ -45,7 +46,7 @@ cd D:\STM32Projects\stm32-edge-ai-node\tools
 D:\STM32Projects\pc-venv\Scripts\python.exe selftest.py
 ```
 
-全绿输出 `结果：317 通过 / 0 失败` 且退出码为 0。退出码非 0 说明协议层被动过。
+全绿输出 `结果：331 通过 / 0 失败` 且退出码为 0。退出码非 0 说明协议层被动过。
 
 ## 用法
 
@@ -905,3 +906,78 @@ python tools/iotda_link_test.py ... --only ts           # sig_type × ts 矩阵�
 🔴 **④的坑**：PC 探针和板子同 `device_id` 同时在线时，平台不报错、两边都以为正常，
 但**影子只留最后一条**。现象是"影子 77、板子说它发了 99"，人会去怀疑固件/报文/物模型，
 真因是两条连接打架。**联调时只留一条；需要并存就再注册一个 `stm32-02` 给 PC。**
+
+---
+
+## `iotda_shadow_check.py` — 云端影子 ↔ 串口日志对账（2026-10-28 新增）
+
+### 为什么还要这一步
+
+`T10` 上云闭环当时用 **`puback`** 当判据。但它只证明一件事：**平台收到了这些字节**。
+内容对不对，它一个字都没说 —— 证据就在 `main.c:136` 那段注释里：
+影子停在 `similarity=55`，板子还在照常发，**`puback` 一动不动地照常回**。
+所以"上云闭环"缺这一步就只能算半个。
+
+### 为什么不做"逐条对账"
+
+平台**不保存全量历史**：设备影子每个属性只留**最新值**（每次上报覆盖）；
+历史报文要走「设备消息」，那是另一条链路（控制台翻页 / 配数据转发到 OBS 或 DB），
+都不属于"跑个脚本就能验"。所以只做两件确定能做对的事：
+
+| 判据 | 内容 |
+|---|---|
+| **J1** | 末行 `#N` 与同行 `puback` **至多差 1**（只允许 1 条在途） |
+| **J2** | `#N` 不小于日志里的上报行数（小于 ⇒ 中途复位过） |
+| **J3** | 影子 `similarity` == 末条 `sim` |
+| **J4** | 影子 `verdict` == 末条 `verdict` |
+| **J5** | 影子 `service_id` == 固件 `CLOUD_SERVICE_ID`（取不到则跳过，不算失败） |
+
+### 🔴 最容易搞错的一点：`#N` 与 `puback` 天然差 1
+
+固件里 `s_cloud.reports++` 在 printf **之前**（`main.c:1494`），
+`s_cloud.pubacks++` 在**收到 PUBACK 时**（`main.c:1574`）。
+所以第 N 条刚发出去、它的回执还没回来，同一行必然是：
+
+```
+[CLOUD] #72 sim=55 ANOMALY (puback=71)
+```
+
+**这是机制使然，不是丢了一条。** 所以：
+- ⛔ 不要写成 "`puback` 72/72" —— 懂行的一问"最后一条你怎么知道收到了"就答不上来；
+- ✅ 正确说法：**「72 条上报，末行 `#72 / puback=71`，末条的回执在打印之后才到，日志不体现」**。
+
+> 这条结论是 2026-10-28 用三份真实日志（`rec2.txt` 30 条 / `mt1.txt` 8 条 / `cap3.txt` 13 条）
+> 全部验证过的，无例外。
+
+### 影子 JSON 从哪来
+
+1. 控制台「设备详情 → 设备影子」右上角的 JSON，另存为文件 → `--shadow shadow.json`
+2. 直接粘进来 → `--shadow -`（读 stdin）
+3. 不知道长什么样 → `--emit-template` 打一份骨架
+
+⚠️ 平台返回的嵌套层级会随版本变，所以脚本**按 key 递归查找、不写死路径**，
+并把"从哪条路径取到的"打出来。路径长得不对一眼能看见，而不是静默取到同名字段。
+
+### 用法
+
+```bash
+# 0) 离线自测（18 条断言，不需要板子）
+python tools/iotda_shadow_check.py --selftest
+
+# 1) 只看设备侧报了些什么（不需要影子）
+python tools/iotda_shadow_check.py --log cloud.log
+
+# 2) 完整对账 —— 🔴 先停设备再看影子，否则对上可能只是"碰巧撞上"
+python tools/iotda_shadow_check.py --log cloud.log --shadow shadow.json
+
+# 3) 从串口实时录 120 s 再对账（需要 pyserial）
+python tools/iotda_shadow_check.py --serial COM5 --seconds 120 --shadow shadow.json
+```
+
+退出码：`0` 全 PASS / `1` 有 FAIL / `2` 输入有问题（没日志、或日志里没有上报行）。
+
+### 与上面「④ 双连接」那个坑的关系
+
+上一节说过：PC 探针和板子同 `device_id` 并存时**影子只留最后一条**。
+本工具正好能把这种情况**显式暴露出来**——如果你跑完 J3/J4 对不上，
+**先确认那时候是不是还有第二条连接在发**，别急着怀疑固件。
