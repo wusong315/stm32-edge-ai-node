@@ -49,3 +49,9 @@ Core/Inc/secrets.h
 data/
 windows*/
 vibration*
+
+# ===== 云端对账的运行产物（每次都不一样，不入库）=====
+# cloud.log：从串口录的原始日志；shadow.json：从控制台复制的影子快照。
+# 骨架可以用 `python tools/iotda_shadow_check.py --emit-template` 生成。
+tools/cloud.log
+tools/shadow.json
