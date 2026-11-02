@@ -50,7 +50,8 @@
   python iotda_shadow_check.py --log cloud.log --shadow shadow.json
 
   # 3) 从串口实时录一段再对账（需要 pyserial；板子要在跑 mode 3 + 上云）
-  python iotda_shadow_check.py --serial COM5 --seconds 120 --shadow shadow.json
+  python iotda_shadow_check.py --serial COM5 --seconds 120 --save cloud.log
+  python iotda_shadow_check.py --log cloud.log --shadow shadow.json     # 停设备、取影子后再跑
 
 ⚠️ 时序很重要：**先停设备、再看影子**。设备还在发的时候影子一直在变，
    对上的可能只是"碰巧撞上"，而不是"最后那条对上"。
@@ -355,8 +356,13 @@ def selftest() -> int:
 # 主流程
 # ─────────────────────────────────────────────────────────────
 
-def read_serial(port: str, seconds: float, baud: int = 115200) -> str:
-    """从串口录一段（需要 pyserial）。板子在跑 mode 3 + 上云时用。"""
+def read_serial(port: str, seconds: float, baud: int = 115200,
+                save_path: str | None = None) -> str:
+    """从串口录一段（需要 pyserial）。板子在跑 mode 3 + 上云时用。
+
+    `save_path` 给了就把原始日志落盘 —— 这一步不能省：
+    影子要在**停设备之后**才取，那时串口已经关了，没有落盘就没法回头对账。
+    """
     try:
         import serial  # type: ignore
     except ImportError:
@@ -375,7 +381,12 @@ def read_serial(port: str, seconds: float, baud: int = 115200) -> str:
                     buf.append(line.decode("utf-8", "replace"))
         except KeyboardInterrupt:
             pass
-    return "".join(buf)
+
+    text = "".join(buf)
+    if save_path:
+        pathlib.Path(save_path).write_text(text, encoding="utf-8")
+        print(f"[serial] 已存 {len(text)} 字符 → {save_path}", file=sys.stderr)
+    return text
 
 
 def main() -> int:
@@ -386,6 +397,9 @@ def main() -> int:
     ap.add_argument("--log", help="串口日志文件（含 [CLOUD] #N ... 行）")
     ap.add_argument("--serial", help="改为从串口实时录（需要 pyserial）")
     ap.add_argument("--seconds", type=float, default=120.0, help="--serial 录制时长，默认 120 s")
+    ap.add_argument("--save", default="cloud.log",
+                    help="--serial 录制时把原始日志存到这里，默认 cloud.log"
+                         "（取影子要在停设备之后，不落盘就没法回头对账）")
     ap.add_argument("--shadow", help="设备影子 JSON 文件；写 - 表示从 stdin 读")
     ap.add_argument("--service-id", default="vibration", help="物模型服务 ID，默认 vibration")
     ap.add_argument("--emit-template", action="store_true", help="打印一份影子 JSON 骨架后退出")
@@ -402,7 +416,7 @@ def main() -> int:
 
     # ── 取日志
     if args.serial:
-        text = read_serial(args.serial, args.seconds)
+        text = read_serial(args.serial, args.seconds, save_path=args.save)
     elif args.log:
         p = pathlib.Path(args.log)
         if not p.exists():
